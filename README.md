@@ -2,56 +2,85 @@
 
 Автоматическое резервирование двух AmneziaWG-туннелей для Podkop на OpenWrt.
 
-Подходит для роутеров, где интернет приходит через:
+Подходит для роутеров, где интернет приходит через LTE/5G (`wwand`, QMI/MBIM), Ethernet WAN/DHCP/PPPoE, Wi‑Fi uplink или любой другой uplink с рабочим IPv4 default route.
 
-- LTE/5G (`wwand`, QMI/MBIM и т.п.);
-- обычный Ethernet WAN/DHCP/PPPoE;
-- Wi‑Fi uplink;
-- любой другой uplink, который создаёт рабочий IPv4 default route.
+## Что делает
 
-Скрипт **не привязан к имени WAN/LTE-интерфейса**. Он ждёт рабочий default route и внешний DNS, затем восстанавливает Podkop/sing-box и запускает AWG failover.
+- основной AmneziaWG: `awg_main`;
+- резервный AmneziaWG: `AWG_backup`;
+- после `FAIL_LIMIT=3` ошибок основного переключает Podkop на резервный;
+- после `RECOVER_LIMIT=3` успешных проверок основного возвращает Podkop на основной;
+- если **оба AWG недоступны**, переводит секцию Podkop в `connection_type=block`;
+- в `block` режиме домены/подсети, назначенные этой секции Podkop, **REJECT'ятся, а не уходят напрямую через WAN**;
+- после восстановления любого AWG автоматически снимает блокировку;
+- исправляет ранний старт Podkop/sing-box после reboot;
+- работает одинаково с LTE и кабельным WAN;
+- повторный запуск `install.sh` является **обновлением**: сохраняет текущие параметры, делает backup и заменяет служебные скрипты актуальной версией.
 
-## Что должно быть настроено заранее
+## Требования
 
-1. OpenWrt работает и имеет интернет.
+1. OpenWrt имеет рабочий интернет.
 2. Podkop установлен и настроен.
-3. Созданы два независимых интерфейса AmneziaWG в `Network → Interfaces`.
-4. Оба AWG должны работать отдельно.
-5. У AWG peer обычно: `Allowed IPs = 0.0.0.0/0` (и при необходимости `::/0`), но **Route Allowed IPs выключено**, чтобы они не перехватывали default route OpenWrt.
-6. `curl`, `nslookup`, `uci`, `ubus` доступны.
+3. Два AmneziaWG-интерфейса уже созданы и каждый работает отдельно.
+4. У AWG peer обычно `Allowed IPs = 0.0.0.0/0` (при необходимости `::/0`), но `Route Allowed IPs` выключено.
+5. Доступны `curl`, `nslookup`, `uci`, `ubus`, `ip`.
+6. Для kill switch нужна версия Podkop с `connection_type=block`. Установщик проверит это автоматически.
 
-Пример имён:
+## Имена интерфейсов и регистр
 
-- основной: `awg_main`
-- резервный: `AWG_backup`
-- секция Podkop: `main`
+Рекомендуемые имена:
 
-Проверка:
-
-```sh
-uci show network | grep -i -E 'awg|amnezia'
-uci show podkop
-awg show
-curl -4 --interface awg_main --max-time 15 https://ifconfig.me/ip
-curl -4 --interface AWG_backup --max-time 15 https://ifconfig.me/ip
+```text
+awg_main
+AWG_backup
 ```
 
-## Установка
+OpenWrt/UCI сам по себе регистрозависим. Поэтому установщик делает разрешение имён **без учёта регистра**, а затем сохраняет реальное каноническое имя UCI.
 
-Скопируйте `install.sh` на роутер, затем:
+Например, все эти варианты найдут один и тот же существующий интерфейс `AWG_backup`:
 
-```sh
-chmod +x install.sh
-MAIN_AWG='awg_main' BACKUP_AWG='AWG_backup' PODKOP_SECTION='main' ./install.sh
+```text
+AWG_backup
+awg_backup
+AwG_BaCkUp
 ```
 
-Если имена именно такие, достаточно:
+Это относится и к `MAIN_AWG`, и к `BACKUP_AWG`, и к имени секции Podkop.
+
+Если на роутере одновременно существуют два UCI-раздела, отличающиеся только регистром, установщик остановится с ошибкой как при неоднозначной конфигурации.
+
+## Установка/обновление с GitHub одной командой
+
+### Если репозиторий публичный
 
 ```sh
-./install.sh
+cd /tmp && \
+wget -O podkop-awg-install.sh \
+https://raw.githubusercontent.com/kumshi1978/openwrt-podkop-awg-failover/main/install.sh && \
+sh podkop-awg-install.sh
 ```
 
-Настраиваемые переменные:
+Эта же команда используется для **обновления** уже установленной версии.
+
+Безопаснее не использовать `wget ... | sh`: сначала файл скачивается, и только потом запускается.
+
+### Если репозиторий private
+
+`raw.githubusercontent.com` не отдаёт private-файл без авторизации. Не рекомендуется постоянно хранить GitHub PAT на роутере.
+
+Для постоянной установки одной командой лучше сделать этот репозиторий public, так как в нём **нет ключей и секретов**. Конфигурации с private key/PSK в репозиторий не добавлять.
+
+## Настройка имён
+
+Если на конкретном роутере интерфейсы называются иначе:
+
+```sh
+MAIN_AWG='Home_Main' BACKUP_AWG='Home_Backup' sh /tmp/podkop-awg-install.sh
+```
+
+Регистр можно писать произвольно.
+
+По умолчанию:
 
 ```text
 MAIN_AWG=awg_main
@@ -64,17 +93,87 @@ RECOVER_LIMIT=3
 STARTUP_GRACE=15
 UPLINK_WAIT=180
 PODKOP_RETRIES=3
+KILL_SWITCH=1
+APPLY_NOW=1
 ```
 
-## Что устанавливается
+## Обновления без потери настроек
 
-- `/usr/bin/podkop-awg-failover` — watchdog двух AWG;
-- `/etc/init.d/podkop-awg-failover` — procd-сервис watchdog;
-- `/usr/bin/podkop-late-start` — исправляет ранний старт Podkop после reboot;
-- `/etc/init.d/podkop-late-start` — однократный late-start;
-- `/etc/podkop-awg-failover.conf` — параметры.
+При первом запуске создаётся:
 
-`podkop-awg-failover` **не включается напрямую в автозапуск**. Его запускает `podkop-late-start` только после готовности uplink и Podkop/sing-box.
+```text
+/etc/podkop-awg-failover.conf
+```
+
+При повторном запуске актуального `install.sh`:
+
+1. читаются уже сохранённые параметры;
+2. параметры из командной строки/environment имеют приоритет;
+3. определяется фактический регистр имён UCI;
+4. создаётся backup;
+5. устанавливается новая версия watchdog/late-start;
+6. конфигурация применяется сразу (`APPLY_NOW=1`).
+
+Таким образом обычное обновление:
+
+```sh
+cd /tmp && \
+wget -O podkop-awg-install.sh \
+https://raw.githubusercontent.com/kumshi1978/openwrt-podkop-awg-failover/main/install.sh && \
+sh podkop-awg-install.sh
+```
+
+не требует заново вводить `MAIN_AWG`, `BACKUP_AWG`, тайминги и kill switch.
+
+Чтобы установить обновление, но применить только после следующей загрузки:
+
+```sh
+APPLY_NOW=0 sh /tmp/podkop-awg-install.sh
+```
+
+## Kill switch: оба AmneziaWG упали
+
+Нормальный режим:
+
+```text
+Podkop selected traffic
+        ↓
+     awg_main
+```
+
+Основной упал:
+
+```text
+Podkop selected traffic
+        ↓
+    AWG_backup
+```
+
+Оба упали:
+
+```text
+Podkop selected traffic
+        ↓
+ connection_type=block
+        ↓
+      REJECT
+```
+
+То есть адреса, домены и подсети, которые Podkop относит к этой секции, **не должны пробовать выйти напрямую через обычный WAN/LTE**.
+
+Watchdog продолжает проверять оба AWG даже в режиме блокировки:
+
+- основной восстановился `RECOVER_LIMIT` раз → `vpn → awg_main`;
+- резервный восстановился `RECOVER_LIMIT` раз раньше основного → `vpn → AWG_backup`;
+- позже при восстановлении основного стандартная логика вернёт трафик на `awg_main`.
+
+Runtime-переключения `vpn ↔ block` и `main ↔ backup` выполняются **без `uci commit`**, поэтому flash не пишется при каждом событии. В постоянной конфигурации сохраняется штатное состояние `vpn + main`.
+
+Отключить kill switch можно только явно:
+
+```sh
+KILL_SWITCH=0 sh /tmp/podkop-awg-install.sh
+```
 
 ## Логика загрузки
 
@@ -85,6 +184,8 @@ OpenWrt boot
    ↓
 проверяем внешний DNS напрямую через 1.1.1.1
    ↓
+Podkop = VPN через main
+   ↓
 restart Podkop
    ↓
 проверяем sing-box + локальный DNS/FakeIP
@@ -94,74 +195,71 @@ restart NTP
 запускаем AWG watchdog
 ```
 
-Это устраняет распространённую гонку загрузки, когда Podkop/sing-box стартует раньше LTE или кабельного WAN и падает с ошибками вроде `missing default interface` / `no route to internet`.
+Скрипт не привязан к `wan`, `LTE`, `wwan0` и т.п. Он ждёт факт появления рабочего uplink.
 
-## Логика failover
-
-Watchdog проверяет **не handshake**, а реальный HTTPS через конкретный AWG-интерфейс.
-
-Норма:
+## Что устанавливается
 
 ```text
-Podkop → awg_main
+/etc/podkop-awg-failover.conf
+/usr/bin/podkop-awg-failover
+/etc/init.d/podkop-awg-failover
+/usr/bin/podkop-late-start
+/etc/init.d/podkop-late-start
 ```
 
-После 3 последовательных ошибок основного, если backup проходит проверку:
+`podkop-awg-failover` не включается напрямую в boot. Его запускает `podkop-late-start` только после готовности uplink, DNS и Podkop.
 
-```text
-Podkop → AWG_backup
-```
-
-Когда основной снова проходит 3 последовательные проверки:
-
-```text
-Podkop → awg_main
-```
-
-Временное переключение выполняется `uci set` **без `uci commit`**, чтобы не писать flash при каждом failover. Постоянным интерфейсом после установки остаётся основной.
-
-## Проверка после reboot
-
-Подождите 2–3 минуты:
+## Проверка
 
 ```sh
-logread | grep -E 'podkop-late|podkop-awg' | tail -40
+cat /etc/podkop-awg-failover.conf
+logread | grep -E 'podkop-late|podkop-awg' | tail -50
 ubus call service list '{"name":"sing-box"}'
 ubus call service list '{"name":"podkop-awg-failover"}'
+uci get podkop.main.connection_type
 uci get podkop.main.interface
-nslookup google.com 127.0.0.1
-awg show | grep -E 'interface:|latest handshake|transfer:'
 ```
 
-Ожидаемый лог:
+При нормальной работе:
 
 ```text
-podkop-late: default route is ready
-podkop-late: external DNS is available
-podkop-late: restarting Podkop, attempt 1/3
-podkop-late: Podkop and sing-box are ready
-podkop-late: NTP restarted
-podkop-late: AWG failover watchdog started
-podkop-late: late-start completed successfully
-podkop-awg: watchdog started: main=... backup=... active=main
-podkop-awg: startup grace: waiting 15 seconds
-podkop-awg: startup grace finished, monitoring started
+connection_type = vpn
+interface       = awg_main
 ```
 
-## Тест реального failover
+## Тест failover
+
+Отключить основной:
 
 ```sh
 ifdown awg_main
 ```
 
-Примерно через 60–90 секунд:
+После трёх неудачных проверок Podkop должен перейти на `AWG_backup`.
+
+Затем отключить и резервный:
 
 ```sh
-logread | grep podkop-awg | tail -20
-uci get podkop.main.interface
+ifdown AWG_backup
 ```
 
-Должно переключиться на backup.
+В логе ожидается:
+
+```text
+both AWG unavailable: enabling Podkop block mode (kill switch)
+```
+
+Проверка:
+
+```sh
+uci get podkop.main.connection_type
+```
+
+Ожидается:
+
+```text
+block
+```
 
 Вернуть основной:
 
@@ -169,46 +267,39 @@ uci get podkop.main.interface
 ifup awg_main
 ```
 
-После трёх успешных recovery-check Podkop должен вернуться на основной.
+После трёх успешных recovery-check:
 
-## LTE и кабельный WAN
+```text
+connection_type = vpn
+interface       = awg_main
+```
 
-Отдельные версии скрипта не нужны.
+## Backup
 
-Для LTE скрипт ждёт появления обычного IPv4 default route после регистрации модема.
-
-Для кабельного WAN ждёт default route, полученный DHCP/PPPoE/static-конфигурацией.
-
-Главное — uplink должен существовать **вне AWG**, а endpoint-адреса обоих AWG должны маршрутизироваться через реальный WAN/LTE.
-
-## Резервная копия
-
-При каждой установке существующие файлы скрипта сохраняются в:
+Каждая установка/обновление сохраняет предыдущие служебные файлы и Podkop UCI export:
 
 ```text
 /root/podkop-awg-backup-YYYYMMDD-HHMMSS/
 ```
 
-Также сохраняется `uci export podkop`.
-
 ## Удаление
 
 ```sh
-chmod +x uninstall.sh
-./uninstall.sh
+cd /tmp && \
+wget -O podkop-awg-uninstall.sh \
+https://raw.githubusercontent.com/kumshi1978/openwrt-podkop-awg-failover/main/uninstall.sh && \
+sh podkop-awg-uninstall.sh
 ```
 
-Удаление не трогает сами AWG-интерфейсы и конфигурацию Podkop, кроме остановки созданных сервисов.
+Удаление не удаляет сами AmneziaWG-интерфейсы.
 
 ## Безопасность
 
-Никогда не коммитьте в Git:
+Никогда не добавлять в Git:
 
 - AmneziaWG private keys;
 - preshared keys;
-- полные `/etc/config/network` с ключами;
+- полный `/etc/config/network` без очистки;
 - SIM IMSI/ICCID;
 - пароли/APN credentials;
-- экспорт конфигурации роутера без очистки секретов.
-
-`.gitignore` закрывает типичные локальные файлы секретов, но это не заменяет проверку перед commit.
+- backup-конфигурации роутера с секретами.
