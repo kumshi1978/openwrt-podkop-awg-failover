@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.2.1"
 CONF="/etc/podkop-awg-failover.conf"
 BACKUP_DIR="/root/podkop-awg-backup-$(date +%Y%m%d-%H%M%S)"
 
@@ -26,11 +26,11 @@ pick() {
 resolve_section_ci() {
     cfg="$1"
     requested="$2"
-    wanted="$(printf '%s' "$requested" | tr '[:upper:]' '[:lower:]')"
+    wanted="$(printf '%s' "$requested" | tr 'A-Z' 'a-z')"
     found=""
     count=0
     for s in $(uci -q show "$cfg" 2>/dev/null | sed -n "s/^$cfg\.\([^.=]*\)=.*/\1/p"); do
-        lower="$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]')"
+        lower="$(printf '%s' "$s" | tr 'A-Z' 'a-z')"
         if [ "$lower" = "$wanted" ]; then
             found="$s"
             count=$((count + 1))
@@ -80,7 +80,7 @@ PODKOP_SECTION="$(resolve_section_ci podkop "$SECTION_REQ")"
 
 [ "$(uci -q get "network.$MAIN_AWG.proto")" = "amneziawg" ] || die "$MAIN_AWG is not proto=amneziawg"
 [ "$(uci -q get "network.$BACKUP_AWG.proto")" = "amneziawg" ] || die "$BACKUP_AWG is not proto=amneziawg"
-[ "$(printf '%s' "$MAIN_AWG" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "$BACKUP_AWG" | tr '[:upper:]' '[:lower:]')" ] || die "main and backup AWG resolve to the same interface"
+[ "$(printf '%s' "$MAIN_AWG" | tr 'A-Z' 'a-z')" != "$(printf '%s' "$BACKUP_AWG" | tr 'A-Z' 'a-z')" ] || die "main and backup AWG resolve to the same interface"
 
 case "$KILL_SWITCH" in 0|1) ;; *) die "KILL_SWITCH must be 0 or 1" ;; esac
 case "$APPLY_NOW" in 0|1) ;; *) die "APPLY_NOW must be 0 or 1" ;; esac
