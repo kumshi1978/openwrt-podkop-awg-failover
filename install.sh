@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 CONF="/etc/podkop-awg-failover.conf"
 BACKUP_DIR="/root/podkop-awg-backup-$(date +%Y%m%d-%H%M%S)"
 
@@ -15,7 +15,6 @@ oldval() {
 }
 
 pick() {
-    # $1 env-set marker, $2 env value, $3 config key, $4 default
     if [ "$1" = "x" ]; then
         printf '%s' "$2"
         return
@@ -86,12 +85,6 @@ PODKOP_SECTION="$(resolve_section_ci podkop "$SECTION_REQ")"
 case "$KILL_SWITCH" in 0|1) ;; *) die "KILL_SWITCH must be 0 or 1" ;; esac
 case "$APPLY_NOW" in 0|1) ;; *) die "APPLY_NOW must be 0 or 1" ;; esac
 
-if [ "$KILL_SWITCH" = "1" ]; then
-    if ! grep -q "Connection type 'block'" /usr/bin/podkop 2>/dev/null && ! grep -q 'block)' /usr/bin/podkop 2>/dev/null; then
-        die "KILL_SWITCH=1 requires a Podkop version with connection_type=block support. Update Podkop first, or run with KILL_SWITCH=0."
-    fi
-fi
-
 mkdir -p "$BACKUP_DIR"
 for f in "$CONF" /usr/bin/podkop-awg-failover /usr/bin/podkop-late-start /etc/init.d/podkop-awg-failover /etc/init.d/podkop-late-start; do
     [ -e "$f" ] && cp -p "$f" "$BACKUP_DIR/$(basename "$f")"
@@ -159,20 +152,22 @@ set_vpn() {
     restart_podkop
 }
 
-set_block() {
+enter_hold() {
     [ "$KILL_SWITCH" = "1" ] || return 1
-    current_type="$(uci -q get "podkop.$SECTION.connection_type")"
-    [ "$current_type" = "block" ] && return 0
-    log "both AWG unavailable: enabling Podkop block mode (kill switch)"
-    uci set "podkop.$SECTION.connection_type=block"
-    restart_podkop
+    current_if="$(uci -q get "podkop.$SECTION.interface")"
+    log "both AWG unavailable: entering hold mode; Podkop stays vpn via ${current_if:-unknown} (fail-closed)"
+    return 0
 }
 
 current_type="$(uci -q get "podkop.$SECTION.connection_type")"
 current_if="$(uci -q get "podkop.$SECTION.interface")"
-if [ "$current_type" = "block" ]; then
-    active="blocked"
-elif [ "$current_if" = "$BACKUP" ]; then
+if [ "$current_type" != "vpn" ]; then
+    log "non-vpn Podkop state detected at watchdog start; restoring vpn via $MAIN"
+    set_vpn "$MAIN"
+    current_if="$MAIN"
+fi
+
+if [ "$current_if" = "$BACKUP" ]; then
     active="backup"
 else
     active="main"
@@ -202,8 +197,8 @@ while true; do
                     else
                         log "main and backup both unavailable"
                         fail_count="$FAIL_LIMIT"
-                        if set_block; then
-                            active="blocked"
+                        if enter_hold; then
+                            active="hold"
                             main_recover=0
                             backup_recover=0
                         fi
@@ -226,32 +221,34 @@ while true; do
                     active="main"
                     main_recover=0
                     fail_count=0
-                elif [ "$backup_ok" = "0" ] && set_block; then
-                    active="blocked"
-                    backup_recover=0
-                    log "backup unavailable while main is still in recovery; traffic blocked"
+                elif [ "$backup_ok" = "0" ]; then
+                    if enter_hold; then
+                        active="hold"
+                        backup_recover=0
+                        log "backup unavailable while main is still in recovery; holding VPN fail-closed"
+                    fi
                 fi
             else
                 main_recover=0
                 if [ "$backup_ok" = "0" ]; then
                     log "backup unavailable and main unavailable"
-                    if set_block; then
-                        active="blocked"
+                    if enter_hold; then
+                        active="hold"
                         backup_recover=0
                     fi
                 fi
             fi
             ;;
-        blocked)
+        hold)
             if check_tunnel "$MAIN"; then
                 main_recover=$((main_recover + 1))
-                log "main recovery check while blocked ($main_recover/$RECOVER_LIMIT)"
+                log "main recovery check while holding ($main_recover/$RECOVER_LIMIT)"
             else
                 main_recover=0
             fi
 
             if [ "$main_recover" -ge "$RECOVER_LIMIT" ]; then
-                log "main recovered; disabling block mode"
+                log "main recovered; leaving hold mode"
                 set_vpn "$MAIN"
                 active="main"
                 main_recover=0
@@ -260,12 +257,12 @@ while true; do
             else
                 if check_tunnel "$BACKUP"; then
                     backup_recover=$((backup_recover + 1))
-                    log "backup recovery check while blocked ($backup_recover/$RECOVER_LIMIT)"
+                    log "backup recovery check while holding ($backup_recover/$RECOVER_LIMIT)"
                 else
                     backup_recover=0
                 fi
                 if [ "$backup_recover" -ge "$RECOVER_LIMIT" ]; then
-                    log "backup recovered; disabling block mode"
+                    log "backup recovered; leaving hold mode"
                     set_vpn "$BACKUP"
                     active="backup"
                     backup_recover=0
@@ -352,7 +349,6 @@ while ! external_dns_ready; do
 done
 log "external DNS is available"
 
-# Persisted/default Podkop state is always VPN via main.
 uci set "podkop.$SECTION.connection_type=vpn"
 uci set "podkop.$SECTION.interface=$MAIN"
 
@@ -404,12 +400,11 @@ chmod +x /etc/init.d/podkop-late-start
 sh -n /usr/bin/podkop-awg-failover || die "watchdog syntax check failed"
 sh -n /usr/bin/podkop-late-start || die "late-start syntax check failed"
 
-# Persist only the normal/default state. Runtime failover and block mode are intentionally not committed.
+# Persist only the normal/default state. Runtime failover/hold changes are not committed.
 uci set "podkop.$PODKOP_SECTION.connection_type=vpn"
 uci set "podkop.$PODKOP_SECTION.interface=$MAIN_AWG"
 uci commit podkop
 
-# Watchdog never starts directly at boot; late-start owns ordering.
 /etc/init.d/podkop-awg-failover disable >/dev/null 2>&1 || true
 /etc/init.d/podkop-awg-failover stop >/dev/null 2>&1 || true
 /etc/init.d/podkop-late-start enable
@@ -425,7 +420,7 @@ say "Version:       $SCRIPT_VERSION"
 say "Main AWG:      $MAIN_AWG"
 say "Backup AWG:    $BACKUP_AWG"
 say "Podkop sect:   $PODKOP_SECTION"
-say "Kill switch:   $KILL_SWITCH"
+say "Kill switch:   $KILL_SWITCH (hold/fail-closed mode)"
 say "Backup:        $BACKUP_DIR"
 say "Status:"
 say "  logread | grep -E 'podkop-late|podkop-awg' | tail -40"
