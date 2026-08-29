@@ -1,0 +1,7 @@
+*.conf
+*.key
+*.private
+*.psk
+secrets/
+backup/
+*.tar.gz
