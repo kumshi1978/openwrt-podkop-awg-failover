@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-SCRIPT_VERSION="1.2.2"
+SCRIPT_VERSION="1.2.3"
 CONF="/etc/podkop-awg-failover.conf"
 BACKUP_DIR="/root/podkop-awg-backup-$(date +%Y%m%d-%H%M%S)"
 
@@ -310,21 +310,7 @@ have_default_route() {
 }
 
 external_dns_ready() {
-    configured_dns="$(uci -q get "podkop.$SECTION.bootstrap_dns_server" 2>/dev/null || true)"
-
-    if [ -n "$configured_dns" ] && nslookup openwrt.org "$configured_dns" >/dev/null 2>&1; then
-        return 0
-    fi
-
-    if [ "$configured_dns" != "8.8.8.8" ] && nslookup openwrt.org 8.8.8.8 >/dev/null 2>&1; then
-        return 0
-    fi
-
-    if [ "$configured_dns" != "1.1.1.1" ] && nslookup openwrt.org 1.1.1.1 >/dev/null 2>&1; then
-        return 0
-    fi
-
-    return 1
+    nslookup openwrt.org >/dev/null 2>&1
 }
 
 singbox_running() {
