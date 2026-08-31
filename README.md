@@ -2,7 +2,7 @@
 
 Автоматическое резервирование двух AmneziaWG-туннелей для Podkop на OpenWrt.
 
-Текущая версия: **1.3.0**.
+Текущая версия: **1.3.1**.
 
 Подходит для роутеров, где интернет приходит через LTE/5G (`wwand`, QMI/MBIM), Ethernet WAN/DHCP/PPPoE, Wi‑Fi uplink или любой другой uplink с рабочим IPv4 default route.
 
@@ -53,6 +53,12 @@ nslookup openwrt.org
 Установщик заменяет список NTP-серверов на российские pool/Stratum 2 с резервом Cloudflare и Google. Перед изменением сохраняется `uci export system` в каталоге backup.
 
 В журнал добавлена диагностика WAN IPv4, диапазона CGNAT `100.64.0.0/10` и публичного IPv4 активного AWG-интерфейса. Реализация использует стандартные BusyBox, UCI, procd и сетевые функции OpenWrt и сохраняет совместимость с протестированными OpenWrt 24.10 и 25.12.
+
+### v1.3.1
+
+Исправлена гонка холодной загрузки, обнаруженная на Cudy с OpenWrt 25.12.5: поздний старт больше не ждёт внешний DNS до запуска Podkop. Готовность проверяется после запуска по фактическому состоянию sing-box, локального DNS на `127.0.0.1` и IPv4 default route.
+
+`podkop-late-start` запускается как `S100`, после штатного `S99podkop`. `podkop-health` и `podkop-awg-failover` включаются как самостоятельные procd/rc.d-сервисы и поэтому не зависят от успешного завершения late-start. Вызовы Podkop restart получили BusyBox-совместимый bounded timeout, а health recovery — взаимное исключение и cooldown по uptime. NTP остаётся необязательным и не блокирует запуск.
 
 ## Требования
 
@@ -124,6 +130,9 @@ UPLINK_WAIT=180
 PODKOP_RETRIES=5
 HEALTH_INTERVAL=30
 HEALTH_FAIL_LIMIT=3
+HEALTH_STARTUP_GRACE=60
+RECOVERY_COOLDOWN=300
+COMMAND_TIMEOUT=45
 KILL_SWITCH=1
 APPLY_NOW=1
 ```
@@ -200,20 +209,18 @@ OpenWrt boot
    ↓
 ждём IPv4 default route
    ↓
-проверяем системное DNS-разрешение через штатный resolver OpenWrt
-   ↓
 Podkop = VPN через main
    ↓
 restart Podkop
    ↓
 проверяем sing-box + локальный DNS/FakeIP
    ↓
-restart NTP
+необязательный restart NTP
    ↓
-запускаем AWG watchdog
+health и AWG watchdog уже независимо запущены через rc.d/procd
 ```
 
-Скрипт не привязан к имени `wan`, `LTE`, `wwan0` и т.п. Он ждёт факт появления рабочего uplink и доступности системного DNS.
+Скрипт не привязан к имени `wan`, `LTE`, `wwan0` и т.п. Late-start ждёт только IPv4 default route; DNS проверяется после запуска Podkop через локальный resolver.
 
 ## Что устанавливается
 
@@ -223,9 +230,11 @@ restart NTP
 /etc/init.d/podkop-awg-failover
 /usr/bin/podkop-late-start
 /etc/init.d/podkop-late-start
+/usr/bin/podkop-health
+/etc/init.d/podkop-health
 ```
 
-`podkop-awg-failover` не включается напрямую в boot. Его запускает `podkop-late-start` только после готовности uplink, DNS и Podkop.
+`podkop-health` и `podkop-awg-failover` включаются напрямую в boot и используют startup grace. Поэтому сбой `podkop-late-start` не оставляет роутер без watchdog. `podkop-late-start` выполняется после штатного Podkop и делает только ограниченное boot-восстановление.
 
 ## Проверка
 

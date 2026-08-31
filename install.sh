@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.3.1"
 CONF="/etc/podkop-awg-failover.conf"
 BACKUP_DIR="/root/podkop-awg-backup-$(date +%Y%m%d-%H%M%S)"
 
@@ -55,6 +55,9 @@ WAIT_SET="${UPLINK_WAIT+x}"; WAIT_ENV="${UPLINK_WAIT-}"
 RETRIES_SET="${PODKOP_RETRIES+x}"; RETRIES_ENV="${PODKOP_RETRIES-}"
 HEALTH_INTERVAL_SET="${HEALTH_INTERVAL+x}"; HEALTH_INTERVAL_ENV="${HEALTH_INTERVAL-}"
 HEALTH_FAIL_SET="${HEALTH_FAIL_LIMIT+x}"; HEALTH_FAIL_ENV="${HEALTH_FAIL_LIMIT-}"
+HEALTH_GRACE_SET="${HEALTH_STARTUP_GRACE+x}"; HEALTH_GRACE_ENV="${HEALTH_STARTUP_GRACE-}"
+COOLDOWN_SET="${RECOVERY_COOLDOWN+x}"; COOLDOWN_ENV="${RECOVERY_COOLDOWN-}"
+COMMAND_TIMEOUT_SET="${COMMAND_TIMEOUT+x}"; COMMAND_TIMEOUT_ENV="${COMMAND_TIMEOUT-}"
 KILL_SET="${KILL_SWITCH+x}"; KILL_ENV="${KILL_SWITCH-}"
 APPLY_SET="${APPLY_NOW+x}"; APPLY_ENV="${APPLY_NOW-}"
 
@@ -70,6 +73,9 @@ UPLINK_WAIT="$(pick "$WAIT_SET" "$WAIT_ENV" UPLINK_WAIT 180)"
 PODKOP_RETRIES="$(pick "$RETRIES_SET" "$RETRIES_ENV" PODKOP_RETRIES 5)"
 HEALTH_INTERVAL="$(pick "$HEALTH_INTERVAL_SET" "$HEALTH_INTERVAL_ENV" HEALTH_INTERVAL 30)"
 HEALTH_FAIL_LIMIT="$(pick "$HEALTH_FAIL_SET" "$HEALTH_FAIL_ENV" HEALTH_FAIL_LIMIT 3)"
+HEALTH_STARTUP_GRACE="$(pick "$HEALTH_GRACE_SET" "$HEALTH_GRACE_ENV" HEALTH_STARTUP_GRACE 60)"
+RECOVERY_COOLDOWN="$(pick "$COOLDOWN_SET" "$COOLDOWN_ENV" RECOVERY_COOLDOWN 300)"
+COMMAND_TIMEOUT="$(pick "$COMMAND_TIMEOUT_SET" "$COMMAND_TIMEOUT_ENV" COMMAND_TIMEOUT 45)"
 KILL_SWITCH="$(pick "$KILL_SET" "$KILL_ENV" KILL_SWITCH 1)"
 APPLY_NOW="$(pick "$APPLY_SET" "$APPLY_ENV" APPLY_NOW 1)"
 
@@ -97,6 +103,26 @@ uci export podkop > "$BACKUP_DIR/podkop.uci" 2>/dev/null || true
 uci export system > "$BACKUP_DIR/system.uci" 2>/dev/null || true
 say "Backup: $BACKUP_DIR"
 
+bounded_run() {
+    limit="$1"
+    shift
+    "$@" &
+    cmd_pid=$!
+    elapsed=0
+    while kill -0 "$cmd_pid" 2>/dev/null; do
+        if [ "$elapsed" -ge "$limit" ]; then
+            kill "$cmd_pid" 2>/dev/null || true
+            sleep 1
+            kill -9 "$cmd_pid" 2>/dev/null || true
+            wait "$cmd_pid" 2>/dev/null || true
+            return 124
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    wait "$cmd_pid"
+}
+
 fix_ntp() {
     uci -q delete system.ntp.server || true
     for server in \
@@ -107,8 +133,11 @@ fix_ntp() {
     done
     uci commit system
     if [ -x /etc/init.d/sysntpd ]; then
-        /etc/init.d/sysntpd restart || true
-        say "NTP servers updated and sysntpd restarted."
+        if bounded_run "$COMMAND_TIMEOUT" /etc/init.d/sysntpd restart; then
+            say "NTP servers updated and sysntpd restarted."
+        else
+            say "NTP servers updated; sysntpd restart failed or timed out, continuing."
+        fi
     else
         say "NTP servers updated; sysntpd is not installed."
     fi
@@ -130,6 +159,9 @@ UPLINK_WAIT='$UPLINK_WAIT'
 PODKOP_RETRIES='$PODKOP_RETRIES'
 HEALTH_INTERVAL='$HEALTH_INTERVAL'
 HEALTH_FAIL_LIMIT='$HEALTH_FAIL_LIMIT'
+HEALTH_STARTUP_GRACE='$HEALTH_STARTUP_GRACE'
+RECOVERY_COOLDOWN='$RECOVERY_COOLDOWN'
+COMMAND_TIMEOUT='$COMMAND_TIMEOUT'
 KILL_SWITCH='$KILL_SWITCH'
 EOF_CONF
 
@@ -149,6 +181,7 @@ FAIL_LIMIT="${FAIL_LIMIT:-3}"
 RECOVER_LIMIT="${RECOVER_LIMIT:-3}"
 STARTUP_GRACE="${STARTUP_GRACE:-15}"
 KILL_SWITCH="${KILL_SWITCH:-1}"
+COMMAND_TIMEOUT="${COMMAND_TIMEOUT:-45}"
 
 fail_count=0
 main_recover=0
@@ -156,12 +189,35 @@ backup_recover=0
 
 log() { logger -t "$TAG" "$*"; }
 
+bounded_run() {
+    limit="$1"
+    shift
+    "$@" &
+    cmd_pid=$!
+    elapsed=0
+    while kill -0 "$cmd_pid" 2>/dev/null; do
+        if [ "$elapsed" -ge "$limit" ]; then
+            kill "$cmd_pid" 2>/dev/null || true
+            sleep 1
+            kill -9 "$cmd_pid" 2>/dev/null || true
+            wait "$cmd_pid" 2>/dev/null || true
+            return 124
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    wait "$cmd_pid"
+}
+
 check_tunnel() {
     curl -4 --interface "$1" --connect-timeout 5 --max-time 10 -fsS "https://${CHECK_HOST}/ip" >/dev/null 2>&1
 }
 
 restart_podkop() {
-    /etc/init.d/podkop restart
+    bounded_run "$COMMAND_TIMEOUT" /etc/init.d/podkop restart || {
+        log "Podkop restart failed or timed out after ${COMMAND_TIMEOUT}s"
+        return 1
+    }
     sleep 5
 }
 
@@ -328,15 +384,58 @@ UPLINK_WAIT="${UPLINK_WAIT:-180}"
 PODKOP_RETRIES="${PODKOP_RETRIES:-5}"
 SECTION="${PODKOP_SECTION:-main}"
 MAIN="${MAIN_AWG:-awg_main}"
+COMMAND_TIMEOUT="${COMMAND_TIMEOUT:-45}"
+RECOVERY_LOCK=/var/run/podkop-recovery.lock
 
 log() { logger -t "$TAG" "$*"; }
 
-have_default_route() {
-    ip -4 route show default 2>/dev/null | grep -q '^default '
+bounded_run() {
+    limit="$1"
+    shift
+    "$@" &
+    cmd_pid=$!
+    elapsed=0
+    while kill -0 "$cmd_pid" 2>/dev/null; do
+        if [ "$elapsed" -ge "$limit" ]; then
+            kill "$cmd_pid" 2>/dev/null || true
+            sleep 1
+            kill -9 "$cmd_pid" 2>/dev/null || true
+            wait "$cmd_pid" 2>/dev/null || true
+            return 124
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    wait "$cmd_pid"
 }
 
-external_dns_ready() {
-    nslookup openwrt.org >/dev/null 2>&1
+acquire_recovery_lock() {
+    waited=0
+    while ! mkdir "$RECOVERY_LOCK" 2>/dev/null; do
+        if [ -r "$RECOVERY_LOCK/pid" ]; then
+            read lock_pid < "$RECOVERY_LOCK/pid" || lock_pid=""
+            if [ -z "$lock_pid" ] || ! kill -0 "$lock_pid" 2>/dev/null; then
+                rm -f "$RECOVERY_LOCK/pid"
+                rmdir "$RECOVERY_LOCK" 2>/dev/null || true
+                continue
+            fi
+        fi
+        [ "$waited" -ge "$COMMAND_TIMEOUT" ] && return 1
+        sleep 1
+        waited=$((waited + 1))
+    done
+    printf '%s\n' "$$" > "$RECOVERY_LOCK/pid"
+    trap 'rm -f "$RECOVERY_LOCK/pid"; rmdir "$RECOVERY_LOCK" 2>/dev/null || true' EXIT INT TERM
+}
+
+release_recovery_lock() {
+    rm -f "$RECOVERY_LOCK/pid"
+    rmdir "$RECOVERY_LOCK" 2>/dev/null || true
+    trap - EXIT INT TERM
+}
+
+have_default_route() {
+    ip -4 route show default 2>/dev/null | grep -q '^default '
 }
 
 singbox_running() {
@@ -374,29 +473,27 @@ while ! have_default_route; do
 done
 log "default route is ready"
 
-elapsed=0
-while ! external_dns_ready; do
-    if [ "$elapsed" -ge 60 ]; then
-        log "external DNS is still unavailable"
-        exit 1
-    fi
-    sleep 5
-    elapsed=$((elapsed + 5))
-done
-log "external DNS is available"
-
 uci set "podkop.$SECTION.connection_type=vpn"
 uci set "podkop.$SECTION.interface=$MAIN"
+
+if ! acquire_recovery_lock; then
+    log "another recovery is active; late-start exits without blocking watchdogs"
+    exit 0
+fi
 
 attempt=1
 while [ "$attempt" -le "$PODKOP_RETRIES" ]; do
     log "restarting Podkop, attempt $attempt/$PODKOP_RETRIES"
     if [ "$attempt" -gt 1 ] && [ -x /etc/init.d/sing-box ]; then
-        /etc/init.d/sing-box restart >/dev/null 2>&1 || true
-        log "sing-box restart requested"
+        bounded_run "$COMMAND_TIMEOUT" /etc/init.d/sing-box restart >/dev/null 2>&1 || true
+        log "bounded sing-box restart requested"
         sleep 5
     fi
-    /etc/init.d/podkop restart
+    if ! bounded_run "$COMMAND_TIMEOUT" /etc/init.d/podkop restart; then
+        log "Podkop restart failed or timed out after ${COMMAND_TIMEOUT}s"
+        attempt=$((attempt + 1))
+        continue
+    fi
     if wait_podkop_ready; then
         log "Podkop, sing-box, DNS and routing are ready"
         break
@@ -407,18 +504,16 @@ done
 
 if ! podkop_ready; then
     log "Podkop failed to become ready"
+    release_recovery_lock
     exit 1
 fi
 
+release_recovery_lock
+
 if [ -x /etc/init.d/sysntpd ]; then
-    /etc/init.d/sysntpd restart
-    log "NTP restarted"
+    bounded_run "$COMMAND_TIMEOUT" /etc/init.d/sysntpd restart >/dev/null 2>&1 && log "NTP restart requested" || log "NTP restart failed or timed out; continuing"
 fi
 
-/etc/init.d/podkop-awg-failover start
-log "AWG failover watchdog started"
-/etc/init.d/podkop-health start
-log "Podkop health watchdog started"
 log "late-start completed successfully"
 exit 0
 EOF_LATE
@@ -426,7 +521,7 @@ chmod +x /usr/bin/podkop-late-start
 
 cat > /etc/init.d/podkop-late-start <<'EOF_INIT_LATE'
 #!/bin/sh /etc/rc.common
-START=98
+START=100
 STOP=10
 USE_PROCD=1
 start_service() {
@@ -452,9 +547,39 @@ MAIN="${MAIN_AWG:-awg_main}"
 INTERVAL="${HEALTH_INTERVAL:-30}"
 FAIL_LIMIT="${HEALTH_FAIL_LIMIT:-3}"
 PODKOP_RETRIES="${PODKOP_RETRIES:-5}"
+STARTUP_GRACE="${HEALTH_STARTUP_GRACE:-60}"
+RECOVERY_COOLDOWN="${RECOVERY_COOLDOWN:-300}"
+COMMAND_TIMEOUT="${COMMAND_TIMEOUT:-45}"
+RECOVERY_LOCK=/var/run/podkop-recovery.lock
 fail_count=0
+last_recovery=0
 
 log() { logger -t "$TAG" "$*"; }
+
+uptime_seconds() {
+    read up rest < /proc/uptime
+    printf '%s' "${up%%.*}"
+}
+
+bounded_run() {
+    limit="$1"
+    shift
+    "$@" &
+    cmd_pid=$!
+    elapsed=0
+    while kill -0 "$cmd_pid" 2>/dev/null; do
+        if [ "$elapsed" -ge "$limit" ]; then
+            kill "$cmd_pid" 2>/dev/null || true
+            sleep 1
+            kill -9 "$cmd_pid" 2>/dev/null || true
+            wait "$cmd_pid" 2>/dev/null || true
+            return 124
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    wait "$cmd_pid"
+}
 
 have_default_route() {
     ip -4 route show default 2>/dev/null | grep -q '^default '
@@ -516,22 +641,50 @@ diagnose_network() {
 }
 
 recover_podkop() {
+    now="$(uptime_seconds)"
+    if [ "$last_recovery" -gt 0 ] && [ $((now - last_recovery)) -lt "$RECOVERY_COOLDOWN" ]; then
+        log "recovery suppressed by ${RECOVERY_COOLDOWN}s cooldown"
+        return 1
+    fi
+    if ! mkdir "$RECOVERY_LOCK" 2>/dev/null; then
+        if [ -r "$RECOVERY_LOCK/pid" ]; then
+            read lock_pid < "$RECOVERY_LOCK/pid" || lock_pid=""
+            if [ -z "$lock_pid" ] || ! kill -0 "$lock_pid" 2>/dev/null; then
+                rm -f "$RECOVERY_LOCK/pid"
+                rmdir "$RECOVERY_LOCK" 2>/dev/null || true
+            fi
+        fi
+        if ! mkdir "$RECOVERY_LOCK" 2>/dev/null; then
+            log "recovery skipped: another recovery is active"
+            return 1
+        fi
+    fi
+    printf '%s\n' "$$" > "$RECOVERY_LOCK/pid"
+    trap 'rm -f "$RECOVERY_LOCK/pid"; rmdir "$RECOVERY_LOCK" 2>/dev/null || true' EXIT INT TERM
+    last_recovery="$now"
     log "recovery started after $FAIL_LIMIT failed health checks"
-    /etc/init.d/podkop-awg-failover stop >/dev/null 2>&1 || true
+    bounded_run "$COMMAND_TIMEOUT" /etc/init.d/podkop-awg-failover stop >/dev/null 2>&1 || true
     attempt=1
     while [ "$attempt" -le "$PODKOP_RETRIES" ]; do
         log "recovery attempt $attempt/$PODKOP_RETRIES"
         if [ -x /etc/init.d/sing-box ]; then
-            /etc/init.d/sing-box restart >/dev/null 2>&1 || true
+            bounded_run "$COMMAND_TIMEOUT" /etc/init.d/sing-box restart >/dev/null 2>&1 || true
             sleep 5
         fi
-        /etc/init.d/podkop restart >/dev/null 2>&1 || true
+        if ! bounded_run "$COMMAND_TIMEOUT" /etc/init.d/podkop restart >/dev/null 2>&1; then
+            log "Podkop restart failed or timed out after ${COMMAND_TIMEOUT}s"
+            attempt=$((attempt + 1))
+            continue
+        fi
         waited=0
         while [ "$waited" -lt 30 ]; do
             if podkop_ready; then
                 /etc/init.d/podkop-awg-failover start >/dev/null 2>&1 || true
                 log "recovery completed; failover watchdog restarted"
                 diagnose_network
+                rm -f "$RECOVERY_LOCK/pid"
+                rmdir "$RECOVERY_LOCK" 2>/dev/null || true
+                trap - EXIT INT TERM
                 return 0
             fi
             sleep 5
@@ -541,10 +694,15 @@ recover_podkop() {
     done
     /etc/init.d/podkop-awg-failover start >/dev/null 2>&1 || true
     log "recovery failed after $PODKOP_RETRIES attempts; will retry after further health checks"
+    rm -f "$RECOVERY_LOCK/pid"
+    rmdir "$RECOVERY_LOCK" 2>/dev/null || true
+    trap - EXIT INT TERM
     return 1
 }
 
-log "health watchdog started: interval=${INTERVAL}s fail_limit=$FAIL_LIMIT"
+log "health watchdog started: interval=${INTERVAL}s fail_limit=$FAIL_LIMIT cooldown=${RECOVERY_COOLDOWN}s"
+log "boot recovery mode: waiting ${STARTUP_GRACE}s before health enforcement"
+sleep "$STARTUP_GRACE"
 diagnose_network
 
 while true; do
@@ -594,10 +752,14 @@ uci commit podkop
 /etc/init.d/podkop-awg-failover stop >/dev/null 2>&1 || true
 /etc/init.d/podkop-health disable >/dev/null 2>&1 || true
 /etc/init.d/podkop-health stop >/dev/null 2>&1 || true
+/etc/init.d/podkop-awg-failover enable
+/etc/init.d/podkop-health enable
 /etc/init.d/podkop-late-start enable
 
 if [ "$APPLY_NOW" = "1" ]; then
     /etc/init.d/podkop-late-start restart
+    /etc/init.d/podkop-awg-failover restart
+    /etc/init.d/podkop-health restart
     say "Installed/updated and applied now."
 else
     say "Installed/updated. APPLY_NOW=0, so changes will activate on next boot."

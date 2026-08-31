@@ -1,6 +1,6 @@
 #!/bin/sh
 # OpenWrt NTP hardening helper
-# v1.3.0 preparation
+# v1.3.1
 
 set -eu
 
@@ -16,7 +16,21 @@ uci add_list system.ntp.server='time.google.com'
 
 uci commit system
 
-/etc/init.d/sysntpd restart || true
+if [ -x /etc/init.d/sysntpd ]; then
+    /etc/init.d/sysntpd restart >/dev/null 2>&1 &
+    ntp_pid=$!
+    waited=0
+    while kill -0 "$ntp_pid" 2>/dev/null; do
+        if [ "$waited" -ge 45 ]; then
+            kill "$ntp_pid" 2>/dev/null || true
+            wait "$ntp_pid" 2>/dev/null || true
+            break
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    wait "$ntp_pid" 2>/dev/null || true
+fi
 
 echo 'NTP servers updated'
 uci show system.ntp
