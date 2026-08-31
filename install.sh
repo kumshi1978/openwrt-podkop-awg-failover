@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-SCRIPT_VERSION="1.3.2"
+SCRIPT_VERSION="1.3.3"
 CONF="/etc/podkop-awg-failover.conf"
 BACKUP_DIR="/root/podkop-awg-backup-$(date +%Y%m%d-%H%M%S)"
 
@@ -209,11 +209,20 @@ bounded_run() {
     wait "$cmd_pid"
 }
 
+dns_ready() {
+    bounded_run 10 nslookup "$CHECK_HOST" >/dev/null 2>&1
+}
+
 check_tunnel() {
+    # Resolve through the system resolver before attributing any failure to AWG.
+    # A resolver timeout/error is unknown: podkop-health owns DNS recovery.
+    dns_ready || return 2
+
     curl -4 --interface "$1" --connect-timeout 5 --max-time 10 -fsS "https://${CHECK_HOST}/ip" >/dev/null 2>&1
     curl_rc=$?
     case "$curl_rc" in
         0) return 0 ;;
+        # DNS can disappear between the readiness check and curl.
         6) return 2 ;;
         *) return 1 ;;
     esac
