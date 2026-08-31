@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-SCRIPT_VERSION="1.3.1"
+SCRIPT_VERSION="1.3.2"
 CONF="/etc/podkop-awg-failover.conf"
 BACKUP_DIR="/root/podkop-awg-backup-$(date +%Y%m%d-%H%M%S)"
 
@@ -211,6 +211,12 @@ bounded_run() {
 
 check_tunnel() {
     curl -4 --interface "$1" --connect-timeout 5 --max-time 10 -fsS "https://${CHECK_HOST}/ip" >/dev/null 2>&1
+    curl_rc=$?
+    case "$curl_rc" in
+        0) return 0 ;;
+        6) return 2 ;;
+        *) return 1 ;;
+    esac
 }
 
 restart_podkop() {
@@ -263,38 +269,50 @@ log "startup grace finished, monitoring started"
 while true; do
     case "$active" in
         main)
-            if check_tunnel "$MAIN"; then
-                fail_count=0
-            else
-                fail_count=$((fail_count + 1))
-                [ "$fail_count" -gt "$FAIL_LIMIT" ] && fail_count="$FAIL_LIMIT"
-                log "main check failed ($fail_count/$FAIL_LIMIT)"
-                if [ "$fail_count" -ge "$FAIL_LIMIT" ]; then
-                    if check_tunnel "$BACKUP"; then
-                        log "main unavailable, backup healthy"
-                        set_vpn "$BACKUP"
-                        active="backup"
-                        fail_count=0
-                        main_recover=0
-                    else
-                        log "main and backup both unavailable"
-                        fail_count="$FAIL_LIMIT"
-                        if enter_hold; then
-                            active="hold"
+            check_tunnel "$MAIN"
+            main_status=$?
+            case "$main_status" in
+                0)
+                    fail_count=0
+                    ;;
+                2)
+                    log "main check unknown: DNS unavailable; counters unchanged"
+                    ;;
+                *)
+                    fail_count=$((fail_count + 1))
+                    [ "$fail_count" -gt "$FAIL_LIMIT" ] && fail_count="$FAIL_LIMIT"
+                    log "main check failed ($fail_count/$FAIL_LIMIT)"
+                    if [ "$fail_count" -ge "$FAIL_LIMIT" ]; then
+                        check_tunnel "$BACKUP"
+                        backup_status=$?
+                        if [ "$backup_status" = "0" ]; then
+                            log "main unavailable, backup healthy"
+                            set_vpn "$BACKUP"
+                            active="backup"
+                            fail_count=0
                             main_recover=0
-                            backup_recover=0
+                        elif [ "$backup_status" = "2" ]; then
+                            log "main unavailable, backup check unknown: DNS unavailable; keeping current VPN fail-closed"
+                        else
+                            log "main and backup both unavailable"
+                            fail_count="$FAIL_LIMIT"
+                            if enter_hold; then
+                                active="hold"
+                                main_recover=0
+                                backup_recover=0
+                            fi
                         fi
                     fi
-                fi
-            fi
+                    ;;
+            esac
             ;;
         backup)
-            main_ok=0
-            backup_ok=0
-            check_tunnel "$MAIN" && main_ok=1
-            check_tunnel "$BACKUP" && backup_ok=1
+            check_tunnel "$MAIN"
+            main_status=$?
+            check_tunnel "$BACKUP"
+            backup_status=$?
 
-            if [ "$main_ok" = "1" ]; then
+            if [ "$main_status" = "0" ]; then
                 main_recover=$((main_recover + 1))
                 log "main recovery check ($main_recover/$RECOVER_LIMIT)"
                 if [ "$main_recover" -ge "$RECOVER_LIMIT" ]; then
@@ -303,30 +321,43 @@ while true; do
                     active="main"
                     main_recover=0
                     fail_count=0
-                elif [ "$backup_ok" = "0" ]; then
+                elif [ "$backup_status" = "1" ]; then
                     if enter_hold; then
                         active="hold"
                         backup_recover=0
                         log "backup unavailable while main is still in recovery; holding VPN fail-closed"
                     fi
                 fi
+            elif [ "$main_status" = "2" ]; then
+                log "main check unknown: DNS unavailable; recovery counter unchanged"
+                if [ "$backup_status" = "2" ]; then
+                    log "backup check unknown: DNS unavailable; keeping current VPN fail-closed"
+                elif [ "$backup_status" = "1" ]; then
+                    log "backup unavailable, main check unknown; keeping current VPN fail-closed"
+                fi
             else
                 main_recover=0
-                if [ "$backup_ok" = "0" ]; then
+                if [ "$backup_status" = "1" ]; then
                     log "backup unavailable and main unavailable"
                     if enter_hold; then
                         active="hold"
                         backup_recover=0
                     fi
+                elif [ "$backup_status" = "2" ]; then
+                    log "main unavailable, backup check unknown: DNS unavailable; keeping current VPN fail-closed"
                 fi
             fi
             ;;
         hold)
-            if check_tunnel "$MAIN"; then
+            check_tunnel "$MAIN"
+            main_status=$?
+            if [ "$main_status" = "0" ]; then
                 main_recover=$((main_recover + 1))
                 log "main recovery check while holding ($main_recover/$RECOVER_LIMIT)"
-            else
+            elif [ "$main_status" = "1" ]; then
                 main_recover=0
+            else
+                log "main check unknown while holding: DNS unavailable; recovery counter unchanged"
             fi
 
             if [ "$main_recover" -ge "$RECOVER_LIMIT" ]; then
@@ -337,11 +368,15 @@ while true; do
                 backup_recover=0
                 fail_count=0
             else
-                if check_tunnel "$BACKUP"; then
+                check_tunnel "$BACKUP"
+                backup_status=$?
+                if [ "$backup_status" = "0" ]; then
                     backup_recover=$((backup_recover + 1))
                     log "backup recovery check while holding ($backup_recover/$RECOVER_LIMIT)"
-                else
+                elif [ "$backup_status" = "1" ]; then
                     backup_recover=0
+                else
+                    log "backup check unknown while holding: DNS unavailable; recovery counter unchanged"
                 fi
                 if [ "$backup_recover" -ge "$RECOVER_LIMIT" ]; then
                     log "backup recovered; leaving hold mode"
@@ -752,14 +787,30 @@ uci commit podkop
 /etc/init.d/podkop-awg-failover stop >/dev/null 2>&1 || true
 /etc/init.d/podkop-health disable >/dev/null 2>&1 || true
 /etc/init.d/podkop-health stop >/dev/null 2>&1 || true
+/etc/init.d/podkop-late-start stop >/dev/null 2>&1 || true
+
+# rc.common disable only knows the current START/STOP values. Remove stale links
+# left by older releases (for example S98 after late-start moved to START=100).
+for rc_link in \
+    /etc/rc.d/S[0-9][0-9]podkop-late-start \
+    /etc/rc.d/S[0-9][0-9][0-9]podkop-late-start \
+    /etc/rc.d/K[0-9][0-9]podkop-late-start \
+    /etc/rc.d/K[0-9][0-9][0-9]podkop-late-start
+do
+    [ -e "$rc_link" ] || [ -L "$rc_link" ] || continue
+    rm -f "$rc_link"
+done
+
 /etc/init.d/podkop-awg-failover enable
 /etc/init.d/podkop-health enable
 /etc/init.d/podkop-late-start enable
 
 if [ "$APPLY_NOW" = "1" ]; then
-    /etc/init.d/podkop-late-start restart
-    /etc/init.d/podkop-awg-failover restart
-    /etc/init.d/podkop-health restart
+    # Services were stopped above. Starting avoids redundant procd delete calls,
+    # which print the harmless but confusing "Command failed: Not found".
+    /etc/init.d/podkop-late-start start
+    /etc/init.d/podkop-awg-failover start
+    /etc/init.d/podkop-health start
     say "Installed/updated and applied now."
 else
     say "Installed/updated. APPLY_NOW=0, so changes will activate on next boot."
