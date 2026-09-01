@@ -2,7 +2,7 @@
 
 Автоматическое резервирование двух AmneziaWG-туннелей для Podkop на OpenWrt.
 
-Текущая версия: **1.3.3**.
+Текущая версия: **1.3.4**.
 
 Подходит для роутеров, где интернет приходит через LTE/5G (`wwand`, QMI/MBIM), Ethernet WAN/DHCP/PPPoE, Wi‑Fi uplink или любой другой uplink с рабочим IPv4 default route.
 
@@ -69,6 +69,12 @@ AWG egress check различает рабочий туннель, реальн�
 ### v1.3.3
 
 Перед каждым AWG egress check выполняется отдельная ограниченная по времени проверка `CHECK_HOST` через системный resolver. Если имя не разрешается или resolver не отвечает, состояние туннеля считается `unknown`: fail/recovery counters не изменяются, переключение AWG и переход в hold не выполняются. `curl` exit 6 остаётся защитой от DNS-сбоя между предварительной проверкой и самим HTTP-запросом. Восстановлением sing-box и локального DNS по-прежнему занимается `podkop-health`.
+
+### v1.3.4
+
+Для Podkop 0.7.x добавлены безопасные DNS-значения по умолчанию. Глобальные `dns_type=udp`, `dns_server=8.8.8.8` и `bootstrap_dns_server=1.1.1.1`, а также `domain_resolver_dns_type=doh` и `domain_resolver_dns_server=8.8.8.8` управляемой VPN-секции задаются только при отсутствующем или пустом параметре. Существующие пользовательские DNS-значения сохраняются. `domain_resolver_enabled` для управляемой секции включается явно.
+
+Логика failover, health, hold/fail-closed, late-start и cold boot не изменена.
 
 ## Требования
 
@@ -339,3 +345,4 @@ sh podkop-awg-uninstall.sh
 - SIM IMSI/ICCID;
 - пароли/APN credentials;
 - backup-конфигурации роутера с секретами.
+

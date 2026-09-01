@@ -1,13 +1,20 @@
 #!/bin/sh
 set -eu
 
-SCRIPT_VERSION="1.3.3"
+SCRIPT_VERSION="1.3.4"
 CONF="/etc/podkop-awg-failover.conf"
 BACKUP_DIR="/root/podkop-awg-backup-$(date +%Y%m%d-%H%M%S)"
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"; }
+
+uci_set_if_empty() {
+    option="$1"
+    default="$2"
+    current="$(uci -q get "$option" 2>/dev/null || true)"
+    [ -n "$current" ] || uci set "$option=$default"
+}
 
 oldval() {
     [ -r "$CONF" ] || return 1
@@ -790,6 +797,12 @@ sh -n /usr/bin/podkop-health || die "health watchdog syntax check failed"
 # Persist only the normal/default state. Runtime failover/hold changes are not committed.
 uci set "podkop.$PODKOP_SECTION.connection_type=vpn"
 uci set "podkop.$PODKOP_SECTION.interface=$MAIN_AWG"
+uci_set_if_empty podkop.settings.dns_type udp
+uci_set_if_empty podkop.settings.dns_server 8.8.8.8
+uci_set_if_empty podkop.settings.bootstrap_dns_server 1.1.1.1
+uci set "podkop.$PODKOP_SECTION.domain_resolver_enabled=1"
+uci_set_if_empty "podkop.$PODKOP_SECTION.domain_resolver_dns_type" doh
+uci_set_if_empty "podkop.$PODKOP_SECTION.domain_resolver_dns_server" 8.8.8.8
 uci commit podkop
 
 /etc/init.d/podkop-awg-failover disable >/dev/null 2>&1 || true
@@ -833,3 +846,4 @@ say "Kill switch:   $KILL_SWITCH (hold/fail-closed mode)"
 say "Backup:        $BACKUP_DIR"
 say "Status:"
 say "  logread | grep -E 'podkop-health|podkop-late|podkop-awg' | tail -60"
+
