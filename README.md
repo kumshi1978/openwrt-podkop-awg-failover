@@ -2,7 +2,7 @@
 
 Автоматическое резервирование двух AmneziaWG-туннелей для Podkop на OpenWrt.
 
-Текущая версия: **1.3.4**.
+Текущая версия: **1.3.5**.
 
 Подходит для роутеров, где интернет приходит через LTE/5G (`wwand`, QMI/MBIM), Ethernet WAN/DHCP/PPPoE, Wi‑Fi uplink или любой другой uplink с рабочим IPv4 default route.
 
@@ -76,6 +76,16 @@ AWG egress check различает рабочий туннель, реальн�
 
 Логика failover, health, hold/fail-closed, late-start и cold boot не изменена.
 
+### v1.3.5
+
+Исправлена boot-race между штатным `S99podkop` и `S100podkop-late-start`, обнаруженная на OpenWrt 24.10.4 с Podkop 0.7.22 и sing-box 1.12.22. Раньше после появления IPv4 default route late-start безусловно выполнял `/etc/init.d/podkop restart`, даже если первый штатный запуск Podkop ещё завершался. Это могло остановить первый sing-box с `context canceled` и временно вызвать серии `missing fakeip record` при повторном запуске.
+
+Теперь после появления IPv4 default route `podkop-late-start` до 60 секунд пассивно ждёт фактической готовности штатного запуска: sing-box должен быть `running`, локальный DNS на `127.0.0.1` должен отвечать и IPv4 default route должен оставаться доступным. Если Podkop готов, restart не выполняется и логируется `Podkop already ready; restart not required`.
+
+Recovery выполняется только после истечения boot-readiness окна. Перед restart берётся общий recovery lock и состояние проверяется повторно: если Podkop успел стать готовым во время ожидания lock, restart также пропускается. Только при сохраняющемся сбое выполняется существующий bounded restart/retry. Failover, health watchdog, hold/fail-closed и recovery cooldown не изменены.
+
+Изменённый shell-код проверен синтаксически в `dash`, `/bin/sh` и BusyBox `ash`; используются только POSIX/BusyBox-совместимые конструкции, применимые к OpenWrt 24.10.x и 25.12.x.
+
 ## Требования
 
 1. OpenWrt имеет рабочий интернет.
@@ -93,7 +103,9 @@ AWG egress check различает рабочий туннель, реальн�
 
 На OpenWrt 24.10.7 отдельно подтверждена совместимость case-insensitive поиска UCI-секций с BusyBox и корректная boot-проверка через системный DNS.
 
-Это не означает, что пакет ограничен этими двумя версиями OpenWrt: они перечислены как фактически протестированные конфигурации.
+Boot-race, исправленная в v1.3.5, была диагностирована на отдельном Cudy с **OpenWrt 24.10.4**, Podkop 0.7.22 и sing-box 1.12.22. После merge v1.3.5 рекомендуется отдельно подтвердить исправление cold boot на реальном 24.10.4 и повторно проверить 25.12.x.
+
+Это не означает, что пакет ограничен этими версиями OpenWrt: они перечислены как фактически протестированные или диагностированные конфигурации.
 
 ## Имена интерфейсов и регистр
 
@@ -223,20 +235,29 @@ Runtime-переключения `main ↔ backup` выполняются без
 ```text
 OpenWrt boot
    ↓
-ждём IPv4 default route
+штатный S99podkop начинает запуск Podkop/sing-box
    ↓
-Podkop = VPN через main
+S100podkop-late-start ждёт IPv4 default route
    ↓
-restart Podkop
+до 60 секунд проверяем:
+sing-box running + локальный DNS 127.0.0.1 + IPv4 default route
    ↓
-проверяем sing-box + локальный DNS/FakeIP
+готово? ── да ──> restart Podkop не требуется
+   │
+   нет
+   ↓
+берём общий recovery lock
+   ↓
+повторно проверяем готовность
+   ↓
+всё ещё не готово? ──> bounded restart/retry Podkop
    ↓
 необязательный restart NTP
    ↓
-health и AWG watchdog уже независимо запущены через rc.d/procd
+health и AWG watchdog независимо работают через rc.d/procd
 ```
 
-Скрипт не привязан к имени `wan`, `LTE`, `wwan0` и т.п. Late-start ждёт только IPv4 default route; DNS проверяется после запуска Podkop через локальный resolver.
+Скрипт не привязан к имени `wan`, `LTE`, `wwan0` и т.п. Late-start ждёт только IPv4 default route, а готовность Podkop проверяет по фактическому состоянию sing-box и локального DNS. На нормальной загрузке уже готовый Podkop не перезапускается.
 
 ## Что устанавливается
 
@@ -268,6 +289,12 @@ uci get podkop.main.interface
 ```text
 connection_type = vpn
 interface       = awg_main
+```
+
+После нормальной cold boot для v1.3.5 ожидается также:
+
+```text
+podkop-late: Podkop already ready; restart not required
 ```
 
 ## Тест failover
@@ -345,4 +372,3 @@ sh podkop-awg-uninstall.sh
 - SIM IMSI/ICCID;
 - пароли/APN credentials;
 - backup-конфигурации роутера с секретами.
-

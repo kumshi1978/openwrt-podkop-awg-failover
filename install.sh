@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-SCRIPT_VERSION="1.3.4"
+SCRIPT_VERSION="1.3.5"
 CONF="/etc/podkop-awg-failover.conf"
 BACKUP_DIR="/root/podkop-awg-backup-$(date +%Y%m%d-%H%M%S)"
 
@@ -436,6 +436,9 @@ PODKOP_RETRIES="${PODKOP_RETRIES:-5}"
 SECTION="${PODKOP_SECTION:-main}"
 MAIN="${MAIN_AWG:-awg_main}"
 COMMAND_TIMEOUT="${COMMAND_TIMEOUT:-45}"
+BOOT_READY_WAIT=60
+RECOVERY_READY_WAIT=30
+DNS_READY_TIMEOUT=5
 RECOVERY_LOCK=/var/run/podkop-recovery.lock
 
 log() { logger -t "$TAG" "$*"; }
@@ -458,6 +461,11 @@ bounded_run() {
         elapsed=$((elapsed + 1))
     done
     wait "$cmd_pid"
+}
+
+uptime_seconds() {
+    read up rest < /proc/uptime
+    printf '%s' "${up%%.*}"
 }
 
 acquire_recovery_lock() {
@@ -494,21 +502,39 @@ singbox_running() {
 }
 
 local_dns_ready() {
-    nslookup google.com 127.0.0.1 >/dev/null 2>&1
+    dns_timeout="${1:-$DNS_READY_TIMEOUT}"
+    bounded_run "$dns_timeout" nslookup google.com 127.0.0.1 >/dev/null 2>&1
 }
 
 podkop_ready() {
-    singbox_running && local_dns_ready && have_default_route
+    dns_timeout="${1:-$DNS_READY_TIMEOUT}"
+    singbox_running && local_dns_ready "$dns_timeout" && have_default_route
 }
 
 wait_podkop_ready() {
-    waited=0
-    while [ "$waited" -lt 30 ]; do
-        podkop_ready && return 0
-        sleep 5
-        waited=$((waited + 5))
+    limit="$1"
+    started="$(uptime_seconds)"
+    while true; do
+        now="$(uptime_seconds)"
+        elapsed=$((now - started))
+        [ "$elapsed" -ge "$limit" ] && return 1
+
+        remaining=$((limit - elapsed))
+        dns_timeout="$DNS_READY_TIMEOUT"
+        [ "$remaining" -lt "$dns_timeout" ] && dns_timeout="$remaining"
+        [ "$dns_timeout" -gt 0 ] || return 1
+        podkop_ready "$dns_timeout" && return 0
+
+        now="$(uptime_seconds)"
+        elapsed=$((now - started))
+        [ "$elapsed" -ge "$limit" ] && return 1
+
+        remaining=$((limit - elapsed))
+        sleep_for=5
+        [ "$remaining" -lt "$sleep_for" ] && sleep_for="$remaining"
+        [ "$sleep_for" -gt 0 ] || return 1
+        sleep "$sleep_for"
     done
-    return 1
 }
 
 log "late-start initiated"
@@ -522,44 +548,54 @@ while ! have_default_route; do
     sleep 5
     elapsed=$((elapsed + 5))
 done
-log "default route is ready"
+log "default route is ready; waiting up to ${BOOT_READY_WAIT}s for stock Podkop startup"
 
-uci set "podkop.$SECTION.connection_type=vpn"
-uci set "podkop.$SECTION.interface=$MAIN"
+if wait_podkop_ready "$BOOT_READY_WAIT"; then
+    log "Podkop already ready; restart not required"
+else
+    log "Podkop not ready within ${BOOT_READY_WAIT}s; entering bounded recovery"
 
-if ! acquire_recovery_lock; then
-    log "another recovery is active; late-start exits without blocking watchdogs"
-    exit 0
-fi
-
-attempt=1
-while [ "$attempt" -le "$PODKOP_RETRIES" ]; do
-    log "restarting Podkop, attempt $attempt/$PODKOP_RETRIES"
-    if [ "$attempt" -gt 1 ] && [ -x /etc/init.d/sing-box ]; then
-        bounded_run "$COMMAND_TIMEOUT" /etc/init.d/sing-box restart >/dev/null 2>&1 || true
-        log "bounded sing-box restart requested"
-        sleep 5
+    if ! acquire_recovery_lock; then
+        log "another recovery is active; late-start exits without blocking watchdogs"
+        exit 0
     fi
-    if ! bounded_run "$COMMAND_TIMEOUT" /etc/init.d/podkop restart; then
-        log "Podkop restart failed or timed out after ${COMMAND_TIMEOUT}s"
-        attempt=$((attempt + 1))
-        continue
-    fi
-    if wait_podkop_ready; then
-        log "Podkop, sing-box, DNS and routing are ready"
-        break
-    fi
-    log "Podkop readiness check failed"
-    attempt=$((attempt + 1))
-done
 
-if ! podkop_ready; then
-    log "Podkop failed to become ready"
+    if podkop_ready; then
+        log "Podkop became ready before recovery; restart not required"
+    else
+        uci set "podkop.$SECTION.connection_type=vpn"
+        uci set "podkop.$SECTION.interface=$MAIN"
+
+        attempt=1
+        while [ "$attempt" -le "$PODKOP_RETRIES" ]; do
+            log "restarting Podkop, attempt $attempt/$PODKOP_RETRIES"
+            if [ "$attempt" -gt 1 ] && [ -x /etc/init.d/sing-box ]; then
+                bounded_run "$COMMAND_TIMEOUT" /etc/init.d/sing-box restart >/dev/null 2>&1 || true
+                log "bounded sing-box restart requested"
+                sleep 5
+            fi
+            if ! bounded_run "$COMMAND_TIMEOUT" /etc/init.d/podkop restart; then
+                log "Podkop restart failed or timed out after ${COMMAND_TIMEOUT}s"
+                attempt=$((attempt + 1))
+                continue
+            fi
+            if wait_podkop_ready "$RECOVERY_READY_WAIT"; then
+                log "Podkop, sing-box, DNS and routing are ready after recovery"
+                break
+            fi
+            log "Podkop readiness check failed after recovery attempt $attempt"
+            attempt=$((attempt + 1))
+        done
+    fi
+
+    if ! podkop_ready; then
+        log "Podkop failed to become ready"
+        release_recovery_lock
+        exit 1
+    fi
+
     release_recovery_lock
-    exit 1
 fi
-
-release_recovery_lock
 
 if [ -x /etc/init.d/sysntpd ]; then
     bounded_run "$COMMAND_TIMEOUT" /etc/init.d/sysntpd restart >/dev/null 2>&1 && log "NTP restart requested" || log "NTP restart failed or timed out; continuing"
@@ -846,4 +882,3 @@ say "Kill switch:   $KILL_SWITCH (hold/fail-closed mode)"
 say "Backup:        $BACKUP_DIR"
 say "Status:"
 say "  logread | grep -E 'podkop-health|podkop-late|podkop-awg' | tail -60"
-
