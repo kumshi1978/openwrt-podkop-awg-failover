@@ -438,6 +438,7 @@ MAIN="${MAIN_AWG:-awg_main}"
 COMMAND_TIMEOUT="${COMMAND_TIMEOUT:-45}"
 BOOT_READY_WAIT=60
 RECOVERY_READY_WAIT=30
+DNS_READY_TIMEOUT=5
 RECOVERY_LOCK=/var/run/podkop-recovery.lock
 
 log() { logger -t "$TAG" "$*"; }
@@ -460,6 +461,11 @@ bounded_run() {
         elapsed=$((elapsed + 1))
     done
     wait "$cmd_pid"
+}
+
+uptime_seconds() {
+    read up rest < /proc/uptime
+    printf '%s' "${up%%.*}"
 }
 
 acquire_recovery_lock() {
@@ -496,22 +502,39 @@ singbox_running() {
 }
 
 local_dns_ready() {
-    bounded_run 10 nslookup google.com 127.0.0.1 >/dev/null 2>&1
+    dns_timeout="${1:-$DNS_READY_TIMEOUT}"
+    bounded_run "$dns_timeout" nslookup google.com 127.0.0.1 >/dev/null 2>&1
 }
 
 podkop_ready() {
-    singbox_running && local_dns_ready && have_default_route
+    dns_timeout="${1:-$DNS_READY_TIMEOUT}"
+    singbox_running && local_dns_ready "$dns_timeout" && have_default_route
 }
 
 wait_podkop_ready() {
     limit="$1"
-    waited=0
-    while [ "$waited" -lt "$limit" ]; do
-        podkop_ready && return 0
-        sleep 5
-        waited=$((waited + 5))
+    started="$(uptime_seconds)"
+    while true; do
+        now="$(uptime_seconds)"
+        elapsed=$((now - started))
+        [ "$elapsed" -ge "$limit" ] && return 1
+
+        remaining=$((limit - elapsed))
+        dns_timeout="$DNS_READY_TIMEOUT"
+        [ "$remaining" -lt "$dns_timeout" ] && dns_timeout="$remaining"
+        [ "$dns_timeout" -gt 0 ] || return 1
+        podkop_ready "$dns_timeout" && return 0
+
+        now="$(uptime_seconds)"
+        elapsed=$((now - started))
+        [ "$elapsed" -ge "$limit" ] && return 1
+
+        remaining=$((limit - elapsed))
+        sleep_for=5
+        [ "$remaining" -lt "$sleep_for" ] && sleep_for="$remaining"
+        [ "$sleep_for" -gt 0 ] || return 1
+        sleep "$sleep_for"
     done
-    podkop_ready
 }
 
 log "late-start initiated"
@@ -530,7 +553,7 @@ log "default route is ready; waiting up to ${BOOT_READY_WAIT}s for stock Podkop 
 if wait_podkop_ready "$BOOT_READY_WAIT"; then
     log "Podkop already ready; restart not required"
 else
-    log "Podkop not ready after ${BOOT_READY_WAIT}s; entering bounded recovery"
+    log "Podkop not ready within ${BOOT_READY_WAIT}s; entering bounded recovery"
 
     if ! acquire_recovery_lock; then
         log "another recovery is active; late-start exits without blocking watchdogs"
