@@ -86,6 +86,39 @@ Recovery выполняется только после истечения boot-
 
 Изменённый shell-код проверен синтаксически в `dash`, `/bin/sh` и BusyBox `ash`; используются только POSIX/BusyBox-совместимые конструкции, применимые к OpenWrt 24.10.x и 25.12.x.
 
+### v1.4.0
+
+Добавлен безопасный сервис автообновления. Он использует только GitHub Releases,
+игнорирует draft/prerelease и принимает исключительно теги вида `vMAJOR.MINOR.PATCH`.
+Ветка `main` не считается каналом обновлений, а более новая установленная версия
+никогда не понижается.
+
+По умолчанию сервис работает в режиме `check`: раз в сутки проверяет stable release
+и пишет результат в системный журнал с тегом `podkop-update`. Режим `apply` включается
+явно в `/etc/podkop-awg-update.conf`. Перед применением `VERSION` и `install.sh`
+сверяются с release tag, проверяется shell-синтаксис и создаётся backup.
+
+Одновременный запуск исключается lock-каталогом. Чтобы парк роутеров не обновлялся
+в один момент, каждый роутер получает стабильную задержку до 6 часов по machine-id
+(с MAC-адресом и hostname как резервными источниками).
+Не требуются `jq`, `flock`, GNU coreutils или bash.
+
+```sh
+/usr/bin/podkop-awg-update check
+/usr/bin/podkop-awg-update apply
+logread | grep podkop-update
+```
+
+Для автоматического применения:
+
+```sh
+sed -i "s/AUTO_UPDATE_MODE='check'/AUTO_UPDATE_MODE='apply'/" /etc/podkop-awg-update.conf
+/etc/init.d/podkop-awg-update restart
+```
+
+По умолчанию: `AUTO_UPDATE_MODE=check`, интервал 86400 секунд, jitter 21600
+секунд и задержка после загрузки 300 секунд.
+
 ## Требования
 
 1. OpenWrt имеет рабочий интернет.
@@ -269,6 +302,9 @@ health и AWG watchdog независимо работают через rc.d/pro
 /etc/init.d/podkop-late-start
 /usr/bin/podkop-health
 /etc/init.d/podkop-health
+/usr/bin/podkop-awg-update
+/etc/init.d/podkop-awg-update
+/etc/podkop-awg-update.conf
 ```
 
 `podkop-health` и `podkop-awg-failover` включаются напрямую в boot и используют startup grace. Поэтому сбой `podkop-late-start` не оставляет роутер без watchdog. `podkop-late-start` выполняется после штатного Podkop и делает только ограниченное boot-восстановление.

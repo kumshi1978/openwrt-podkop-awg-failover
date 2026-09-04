@@ -1,9 +1,12 @@
 #!/bin/sh
 set -eu
 
-SCRIPT_VERSION="1.3.5"
+SCRIPT_VERSION="1.4.0"
 CONF="/etc/podkop-awg-failover.conf"
 BACKUP_DIR="/root/podkop-awg-backup-$(date +%Y%m%d-%H%M%S)"
+UPDATE_SOURCE_REF="${UPDATE_SOURCE_REF:-main}"
+UPDATE_BASE_URL="https://raw.githubusercontent.com/kumshi1978/openwrt-podkop-awg-failover/$UPDATE_SOURCE_REF/scripts"
+UPDATE_TMP="/tmp/podkop-awg-update-install.$$"
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -102,13 +105,32 @@ PODKOP_SECTION="$(resolve_section_ci podkop "$SECTION_REQ")"
 case "$KILL_SWITCH" in 0|1) ;; *) die "KILL_SWITCH must be 0 or 1" ;; esac
 case "$APPLY_NOW" in 0|1) ;; *) die "APPLY_NOW must be 0 or 1" ;; esac
 
+# Fetch every updater component before changing the live installation. Stable
+# release updates set UPDATE_SOURCE_REF to the exact release tag.
+mkdir -p "$UPDATE_TMP"
+trap 'rm -rf "$UPDATE_TMP"' EXIT INT TERM
+for update_file in podkop-awg-update podkop-awg-update.init podkop-awg-update.conf; do
+    curl -4 -fsSL --connect-timeout 10 --max-time "$COMMAND_TIMEOUT" \
+        "$UPDATE_BASE_URL/$update_file" -o "$UPDATE_TMP/$update_file" \
+        || die "cannot download updater component from ref $UPDATE_SOURCE_REF: $update_file"
+done
+sh -n "$UPDATE_TMP/podkop-awg-update" || die "updater syntax check failed"
+sh -n "$UPDATE_TMP/podkop-awg-update.init" || die "updater init syntax check failed"
+
 mkdir -p "$BACKUP_DIR"
-for f in "$CONF" /usr/bin/podkop-awg-failover /usr/bin/podkop-late-start /usr/bin/podkop-health /etc/init.d/podkop-awg-failover /etc/init.d/podkop-late-start /etc/init.d/podkop-health; do
+for f in "$CONF" /etc/podkop-awg-update.conf /usr/bin/podkop-awg-update /usr/bin/podkop-awg-failover /usr/bin/podkop-late-start /usr/bin/podkop-health /etc/init.d/podkop-awg-update /etc/init.d/podkop-awg-failover /etc/init.d/podkop-late-start /etc/init.d/podkop-health; do
     [ -e "$f" ] && cp -p "$f" "$BACKUP_DIR/$(basename "$f")"
 done
 uci export podkop > "$BACKUP_DIR/podkop.uci" 2>/dev/null || true
 uci export system > "$BACKUP_DIR/system.uci" 2>/dev/null || true
 say "Backup: $BACKUP_DIR"
+
+cp "$UPDATE_TMP/podkop-awg-update" /usr/bin/podkop-awg-update
+cp "$UPDATE_TMP/podkop-awg-update.init" /etc/init.d/podkop-awg-update
+chmod +x /usr/bin/podkop-awg-update /etc/init.d/podkop-awg-update
+if [ ! -e /etc/podkop-awg-update.conf ]; then
+    cp "$UPDATE_TMP/podkop-awg-update.conf" /etc/podkop-awg-update.conf
+fi
 
 bounded_run() {
     limit="$1"
@@ -829,6 +851,7 @@ chmod +x /etc/init.d/podkop-health
 sh -n /usr/bin/podkop-awg-failover || die "watchdog syntax check failed"
 sh -n /usr/bin/podkop-late-start || die "late-start syntax check failed"
 sh -n /usr/bin/podkop-health || die "health watchdog syntax check failed"
+sh -n /usr/bin/podkop-awg-update || die "update checker syntax check failed"
 
 # Persist only the normal/default state. Runtime failover/hold changes are not committed.
 uci set "podkop.$PODKOP_SECTION.connection_type=vpn"
@@ -846,6 +869,8 @@ uci commit podkop
 /etc/init.d/podkop-health disable >/dev/null 2>&1 || true
 /etc/init.d/podkop-health stop >/dev/null 2>&1 || true
 /etc/init.d/podkop-late-start stop >/dev/null 2>&1 || true
+/etc/init.d/podkop-awg-update disable >/dev/null 2>&1 || true
+/etc/init.d/podkop-awg-update stop >/dev/null 2>&1 || true
 
 # rc.common disable only knows the current START/STOP values. Remove stale links
 # left by older releases (for example S98 after late-start moved to START=100).
@@ -862,6 +887,7 @@ done
 /etc/init.d/podkop-awg-failover enable
 /etc/init.d/podkop-health enable
 /etc/init.d/podkop-late-start enable
+/etc/init.d/podkop-awg-update enable
 
 if [ "$APPLY_NOW" = "1" ]; then
     # Services were stopped above. Starting avoids redundant procd delete calls,
@@ -869,6 +895,7 @@ if [ "$APPLY_NOW" = "1" ]; then
     /etc/init.d/podkop-late-start start
     /etc/init.d/podkop-awg-failover start
     /etc/init.d/podkop-health start
+    /etc/init.d/podkop-awg-update start
     say "Installed/updated and applied now."
 else
     say "Installed/updated. APPLY_NOW=0, so changes will activate on next boot."
@@ -879,6 +906,7 @@ say "Main AWG:      $MAIN_AWG"
 say "Backup AWG:    $BACKUP_AWG"
 say "Podkop sect:   $PODKOP_SECTION"
 say "Kill switch:   $KILL_SWITCH (hold/fail-closed mode)"
+say "Auto update:   $(sed -n "s/^AUTO_UPDATE_MODE='\([^']*\)'$/\1/p" /etc/podkop-awg-update.conf | tail -n 1)"
 say "Backup:        $BACKUP_DIR"
 say "Status:"
 say "  logread | grep -E 'podkop-health|podkop-late|podkop-awg' | tail -60"
