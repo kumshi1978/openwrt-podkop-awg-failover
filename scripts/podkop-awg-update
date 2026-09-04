@@ -1,0 +1,199 @@
+#!/bin/sh
+
+# Safe stable-release updater for BusyBox ash / OpenWrt.
+CONF=/etc/podkop-awg-update.conf
+STATE_DIR=/tmp/podkop-awg-update
+LOCK_DIR=/var/run/podkop-awg-update.lock
+TAG=podkop-update
+REPO=${UPDATE_REPO:-kumshi1978/openwrt-podkop-awg-failover}
+API_URL="https://api.github.com/repos/$REPO/releases/latest"
+RAW_URL="https://raw.githubusercontent.com/$REPO"
+
+[ -r "$CONF" ] && . "$CONF"
+
+MODE=${AUTO_UPDATE_MODE:-check}
+INTERVAL=${AUTO_UPDATE_INTERVAL:-86400}
+JITTER=${AUTO_UPDATE_JITTER:-21600}
+STARTUP_DELAY=${AUTO_UPDATE_STARTUP_DELAY:-300}
+COMMAND_TIMEOUT=${COMMAND_TIMEOUT:-45}
+
+log() { logger -t "$TAG" "$*"; printf '%s\n' "$*"; }
+die() { log "ERROR: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"; }
+
+bounded_run() {
+    limit="$1"
+    shift
+    "$@" &
+    cmd_pid=$!
+    elapsed=0
+    while kill -0 "$cmd_pid" 2>/dev/null; do
+        if [ "$elapsed" -ge "$limit" ]; then
+            kill "$cmd_pid" 2>/dev/null || true
+            sleep 1
+            kill -9 "$cmd_pid" 2>/dev/null || true
+            wait "$cmd_pid" 2>/dev/null || true
+            return 124
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    wait "$cmd_pid"
+}
+
+release_lock() {
+    rm -f "$LOCK_DIR/pid"
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+    trap - EXIT INT TERM
+}
+
+acquire_lock() {
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        printf '%s\n' "$$" > "$LOCK_DIR/pid"
+        trap release_lock EXIT INT TERM
+        return 0
+    fi
+    lock_pid=""
+    [ -r "$LOCK_DIR/pid" ] && read lock_pid < "$LOCK_DIR/pid"
+    if [ -z "$lock_pid" ] || ! kill -0 "$lock_pid" 2>/dev/null; then
+        rm -f "$LOCK_DIR/pid"
+        rmdir "$LOCK_DIR" 2>/dev/null || true
+        mkdir "$LOCK_DIR" 2>/dev/null || return 1
+        printf '%s\n' "$$" > "$LOCK_DIR/pid"
+        trap release_lock EXIT INT TERM
+        return 0
+    fi
+    return 1
+}
+
+valid_version() {
+    printf '%s\n' "$1" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'
+}
+
+version_gt() {
+    version_a="$1"
+    version_b="$2"
+    old_ifs="$IFS"
+    IFS=.
+    set -- $version_a
+    a1=$1 a2=$2 a3=$3
+    set -- $version_b
+    b1=$1 b2=$2 b3=$3
+    IFS="$old_ifs"
+    [ "$a1" -gt "$b1" ] && return 0
+    [ "$a1" -lt "$b1" ] && return 1
+    [ "$a2" -gt "$b2" ] && return 0
+    [ "$a2" -lt "$b2" ] && return 1
+    [ "$a3" -gt "$b3" ]
+}
+
+fetch_release() {
+    mkdir -p "$STATE_DIR"
+    release_json="$STATE_DIR/release.json"
+    bounded_run "$COMMAND_TIMEOUT" curl -4 -fsSL \
+        --connect-timeout 10 --max-time "$COMMAND_TIMEOUT" \
+        -H 'Accept: application/vnd.github+json' \
+        -H 'X-GitHub-Api-Version: 2022-11-28' \
+        "$API_URL" -o "$release_json" || die "cannot fetch stable release metadata"
+
+    compact="$(tr -d '\r\n' < "$release_json")"
+    printf '%s\n' "$compact" | grep -Eq '"draft"[[:space:]]*:[[:space:]]*false' || die "latest release is draft or metadata is invalid"
+    printf '%s\n' "$compact" | grep -Eq '"prerelease"[[:space:]]*:[[:space:]]*false' || die "latest release is prerelease or metadata is invalid"
+    release_tag="$(printf '%s\n' "$compact" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\(v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p')"
+    [ -n "$release_tag" ] || die "stable release tag is missing or invalid"
+    release_version=${release_tag#v}
+    valid_version "$release_version" || die "invalid stable release version: $release_version"
+}
+
+installed_version() {
+    current=""
+    if [ -r /etc/podkop-awg-failover.conf ]; then
+        current="$(sed -n "s/^INSTALLED_VERSION='\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)'$/\1/p" /etc/podkop-awg-failover.conf | tail -n 1)"
+    fi
+    [ -n "$current" ] || current=0.0.0
+    valid_version "$current" || die "invalid installed version: $current"
+}
+
+check_release() {
+    fetch_release
+    installed_version
+    if version_gt "$release_version" "$current"; then
+        log "stable update available: $current -> $release_version ($release_tag)"
+        return 10
+    fi
+    if version_gt "$current" "$release_version"; then
+        log "installed version $current is newer than latest stable $release_version; no downgrade"
+    else
+        log "installed version $current is the latest stable release"
+    fi
+    return 0
+}
+
+apply_release() {
+    check_release
+    check_rc=$?
+    [ "$check_rc" -eq 10 ] || return "$check_rc"
+
+    work="$STATE_DIR/$release_tag"
+    mkdir -p "$work"
+    version_file="$work/VERSION"
+    installer="$work/install.sh"
+    bounded_run "$COMMAND_TIMEOUT" curl -4 -fsSL --connect-timeout 10 --max-time "$COMMAND_TIMEOUT" \
+        "$RAW_URL/$release_tag/VERSION" -o "$version_file" || die "cannot download VERSION from $release_tag"
+    bounded_run "$COMMAND_TIMEOUT" curl -4 -fsSL --connect-timeout 10 --max-time "$COMMAND_TIMEOUT" \
+        "$RAW_URL/$release_tag/install.sh" -o "$installer" || die "cannot download installer from $release_tag"
+
+    downloaded_version="$(tr -d '\r\n' < "$version_file")"
+    [ "$downloaded_version" = "$release_version" ] || die "release VERSION does not match tag"
+    grep -Fq "SCRIPT_VERSION=\"$release_version\"" "$installer" || die "installer version does not match release"
+    sh -n "$installer" || die "downloaded installer failed syntax validation"
+
+    backup="/root/podkop-awg-update-backup-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$backup"
+    cp -p "$installer" "$version_file" "$release_json" "$backup/"
+    [ -r /etc/podkop-awg-failover.conf ] && cp -p /etc/podkop-awg-failover.conf "$backup/"
+    log "applying stable release $release_tag; pre-apply backup: $backup"
+    if UPDATE_SOURCE_REF="$release_tag" APPLY_NOW=1 sh "$installer"; then
+        log "stable release $release_tag applied successfully"
+    else
+        die "installer failed; backup retained at $backup"
+    fi
+}
+
+cohort_delay() {
+    [ "$JITTER" -gt 0 ] 2>/dev/null || { printf '0'; return; }
+    seed="$(cat /etc/machine-id 2>/dev/null || cat /sys/class/net/eth0/address 2>/dev/null || hostname)"
+    number="$(printf '%s' "$seed" | cksum | sed 's/ .*//')"
+    printf '%s' "$((number % JITTER))"
+}
+
+run_once() {
+    acquire_lock || { log "another update check is already running; skipped"; return 0; }
+    case "$1" in
+        check) check_release; rc=$?; [ "$rc" -eq 10 ] && rc=0 ;;
+        apply) apply_release; rc=$? ;;
+        *) rc=2 ;;
+    esac
+    release_lock
+    return "$rc"
+}
+
+daemon() {
+    case "$MODE" in check|apply) ;; *) die "AUTO_UPDATE_MODE must be check or apply" ;; esac
+    sleep "$STARTUP_DELAY"
+    delay="$(cohort_delay)"
+    log "automatic stable-release mode=$MODE; fleet delay=${delay}s; interval=${INTERVAL}s"
+    sleep "$delay"
+    while true; do
+        run_once "$MODE" || true
+        sleep "$INTERVAL"
+    done
+}
+
+for tool in curl grep sed tr logger cksum; do need "$tool"; done
+case "${1:-}" in
+    check) run_once check ;;
+    apply) run_once apply ;;
+    daemon) daemon ;;
+    *) printf 'Usage: %s {check|apply|daemon}\n' "$0" >&2; exit 2 ;;
+esac
