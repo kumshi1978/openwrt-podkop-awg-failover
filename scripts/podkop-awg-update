@@ -162,9 +162,43 @@ apply_release() {
 
 cohort_delay() {
     [ "$JITTER" -gt 0 ] 2>/dev/null || { printf '0'; return; }
-    seed="$(cat /etc/machine-id 2>/dev/null || cat /sys/class/net/eth0/address 2>/dev/null || hostname)"
-    number="$(printf '%s' "$seed" | cksum | sed 's/ .*//')"
-    printf '%s' "$((number % JITTER))"
+
+    # Avoid optional cksum/coreutils dependencies. OpenWrt normally has a
+    # hexadecimal machine-id; use its first 8 hex digits as a stable router
+    # cohort number. Fall back to the first four MAC octets, then zero.
+    if [ -r /etc/machine-id ]; then
+        read seed < /etc/machine-id
+        prefix="$(printf '%.8s' "$seed")"
+        case "$prefix" in
+            ''|*[!0-9A-Fa-f]*) prefix='' ;;
+        esac
+        if [ -n "$prefix" ]; then
+            number=$((0x$prefix))
+            printf '%s' "$((number % JITTER))"
+            return
+        fi
+    fi
+
+    if [ -r /sys/class/net/eth0/address ]; then
+        read mac < /sys/class/net/eth0/address
+        old_ifs="$IFS"
+        IFS=:
+        set -- $mac
+        IFS="$old_ifs"
+        if [ "$#" -ge 4 ]; then
+            prefix="$1$2$3$4"
+            case "$prefix" in
+                ''|*[!0-9A-Fa-f]*) prefix='' ;;
+            esac
+            if [ -n "$prefix" ]; then
+                number=$((0x$prefix))
+                printf '%s' "$((number % JITTER))"
+                return
+            fi
+        fi
+    fi
+
+    printf '0'
 }
 
 run_once() {
@@ -190,7 +224,7 @@ daemon() {
     done
 }
 
-for tool in curl grep sed tr logger cksum; do need "$tool"; done
+for tool in curl grep sed tr logger; do need "$tool"; done
 case "${1:-}" in
     check) run_once check ;;
     apply) run_once apply ;;
