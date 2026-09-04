@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.4.1"
 CONF="/etc/podkop-awg-failover.conf"
 BACKUP_DIR="/root/podkop-awg-backup-$(date +%Y%m%d-%H%M%S)"
 UPDATE_SOURCE_REF="${UPDATE_SOURCE_REF:-main}"
