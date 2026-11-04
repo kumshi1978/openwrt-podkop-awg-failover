@@ -6,7 +6,7 @@ CONF="/etc/podkop-awg-failover.conf"
 BACKUP_DIR="/root/podkop-awg-backup-$(date +%Y%m%d-%H%M%S)"
 UPDATE_SOURCE_REF="${UPDATE_SOURCE_REF:-main}"
 UPDATE_BASE_URL="https://raw.githubusercontent.com/kumshi1978/openwrt-podkop-awg-failover/$UPDATE_SOURCE_REF/scripts"
-UPDATE_TMP="/tmp/podkop-awg-update-install.$$"
+UPDATE_TMP=''
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
