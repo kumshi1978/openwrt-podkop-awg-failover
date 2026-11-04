@@ -135,7 +135,7 @@ fi
 bounded_run() {
     limit="$1"
     shift
-    "$@" &
+    "$@" 9>&- &
     cmd_pid=$!
     elapsed=0
     while kill -0 "$cmd_pid" 2>/dev/null; do
@@ -221,7 +221,7 @@ log() { logger -t "$TAG" "$*"; }
 bounded_run() {
     limit="$1"
     shift
-    "$@" &
+    "$@" 9>&- &
     cmd_pid=$!
     elapsed=0
     while kill -0 "$cmd_pid" 2>/dev/null; do
@@ -265,7 +265,18 @@ restart_podkop() {
     sleep 5
 }
 
-set_vpn() {
+maintenance_lock() {
+    # A kernel lock is released on exit, crash or reboot. Keep its inode stable.
+    if command -v flock >/dev/null 2>&1; then
+        (umask 077; : >>/var/run/home-net-vpn-maintenance.lock) || return 1
+        exec 9>>/var/run/home-net-vpn-maintenance.lock || return 1
+        flock -n 9 || return 1
+    fi
+    return 0
+}
+
+set_vpn() (
+    maintenance_lock || return 1
     target="$1"
     current_type="$(uci -q get "podkop.$SECTION.connection_type")"
     current_if="$(uci -q get "podkop.$SECTION.interface")"
@@ -276,7 +287,7 @@ set_vpn() {
     uci set "podkop.$SECTION.connection_type=vpn"
     uci set "podkop.$SECTION.interface=$target"
     restart_podkop
-}
+)
 
 enter_hold() {
     [ "$KILL_SWITCH" = "1" ] || return 1
@@ -289,8 +300,7 @@ current_type="$(uci -q get "podkop.$SECTION.connection_type")"
 current_if="$(uci -q get "podkop.$SECTION.interface")"
 if [ "$current_type" != "vpn" ]; then
     log "non-vpn Podkop state detected at watchdog start; restoring vpn via $MAIN"
-    set_vpn "$MAIN"
-    current_if="$MAIN"
+    if set_vpn "$MAIN"; then current_if="$MAIN"; fi
 fi
 
 if [ "$current_if" = "$BACKUP" ]; then
@@ -325,7 +335,7 @@ while true; do
                         backup_status=$?
                         if [ "$backup_status" = "0" ]; then
                             log "main unavailable, backup healthy"
-                            set_vpn "$BACKUP"
+                            set_vpn "$BACKUP" || { sleep "$INTERVAL"; continue; }
                             active="backup"
                             fail_count=0
                             main_recover=0
@@ -355,7 +365,7 @@ while true; do
                 log "main recovery check ($main_recover/$RECOVER_LIMIT)"
                 if [ "$main_recover" -ge "$RECOVER_LIMIT" ]; then
                     log "main recovered"
-                    set_vpn "$MAIN"
+                    set_vpn "$MAIN" || { sleep "$INTERVAL"; continue; }
                     active="main"
                     main_recover=0
                     fail_count=0
@@ -400,7 +410,7 @@ while true; do
 
             if [ "$main_recover" -ge "$RECOVER_LIMIT" ]; then
                 log "main recovered; leaving hold mode"
-                set_vpn "$MAIN"
+                set_vpn "$MAIN" || { sleep "$INTERVAL"; continue; }
                 active="main"
                 main_recover=0
                 backup_recover=0
@@ -418,7 +428,7 @@ while true; do
                 fi
                 if [ "$backup_recover" -ge "$RECOVER_LIMIT" ]; then
                     log "backup recovered; leaving hold mode"
-                    set_vpn "$BACKUP"
+                    set_vpn "$BACKUP" || { sleep "$INTERVAL"; continue; }
                     active="backup"
                     backup_recover=0
                 fi
@@ -468,7 +478,7 @@ log() { logger -t "$TAG" "$*"; }
 bounded_run() {
     limit="$1"
     shift
-    "$@" &
+    "$@" 9>&- &
     cmd_pid=$!
     elapsed=0
     while kill -0 "$cmd_pid" 2>/dev/null; do
@@ -572,11 +582,22 @@ while ! have_default_route; do
 done
 log "default route is ready; waiting up to ${BOOT_READY_WAIT}s for stock Podkop startup"
 
+maintenance_lock() {
+    # A kernel lock is released on exit, crash or reboot. Keep its inode stable.
+    if command -v flock >/dev/null 2>&1; then
+        (umask 077; : >>/var/run/home-net-vpn-maintenance.lock) || return 1
+        exec 9>>/var/run/home-net-vpn-maintenance.lock || return 1
+        flock -n 9 || return 1
+    fi
+    return 0
+}
+
 if wait_podkop_ready "$BOOT_READY_WAIT"; then
     log "Podkop already ready; restart not required"
 else
     log "Podkop not ready within ${BOOT_READY_WAIT}s; entering bounded recovery"
 
+    maintenance_lock || exit 0
     if ! acquire_recovery_lock; then
         log "another recovery is active; late-start exits without blocking watchdogs"
         exit 0
@@ -617,6 +638,7 @@ else
     fi
 
     release_recovery_lock
+    exec 9>&-
 fi
 
 if [ -x /etc/init.d/sysntpd ]; then
@@ -673,7 +695,7 @@ uptime_seconds() {
 bounded_run() {
     limit="$1"
     shift
-    "$@" &
+    "$@" 9>&- &
     cmd_pid=$!
     elapsed=0
     while kill -0 "$cmd_pid" 2>/dev/null; do
@@ -747,6 +769,16 @@ diagnose_network() {
     else
         log "AWG public IP via $active is unavailable"
     fi
+}
+
+maintenance_lock() {
+    # A kernel lock is released on exit, crash or reboot. Keep its inode stable.
+    if command -v flock >/dev/null 2>&1; then
+        (umask 077; : >>/var/run/home-net-vpn-maintenance.lock) || return 1
+        exec 9>>/var/run/home-net-vpn-maintenance.lock || return 1
+        flock -n 9 || return 1
+    fi
+    return 0
 }
 
 recover_podkop() {
@@ -823,7 +855,8 @@ while true; do
         [ "$fail_count" -gt "$FAIL_LIMIT" ] && fail_count="$FAIL_LIMIT"
         log "health check failed ($fail_count/$FAIL_LIMIT): sing-box, local DNS or routing is not ready"
         if [ "$fail_count" -ge "$FAIL_LIMIT" ]; then
-            recover_podkop || true
+            if maintenance_lock; then recover_podkop || true; fi
+            exec 9>&-
             fail_count=0
         fi
     fi
