@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-SCRIPT_VERSION="1.4.1"
+SCRIPT_VERSION="1.4.2"
 CONF="/etc/podkop-awg-failover.conf"
 BACKUP_DIR="/root/podkop-awg-backup-$(date +%Y%m%d-%H%M%S)"
 UPDATE_SOURCE_REF="${UPDATE_SOURCE_REF:-main}"
@@ -88,6 +88,7 @@ RECOVERY_COOLDOWN="$(pick "$COOLDOWN_SET" "$COOLDOWN_ENV" RECOVERY_COOLDOWN 300)
 COMMAND_TIMEOUT="$(pick "$COMMAND_TIMEOUT_SET" "$COMMAND_TIMEOUT_ENV" COMMAND_TIMEOUT 45)"
 KILL_SWITCH="$(pick "$KILL_SET" "$KILL_ENV" KILL_SWITCH 1)"
 APPLY_NOW="$(pick "$APPLY_SET" "$APPLY_ENV" APPLY_NOW 1)"
+PREVIOUS_VERSION="$(oldval INSTALLED_VERSION || true)"
 
 [ "$(id -u)" = "0" ] || die "run as root"
 for x in uci ubus curl nslookup ip logger sed grep tr; do need "$x"; done
@@ -172,7 +173,7 @@ fix_ntp() {
     fi
 }
 
-fix_ntp
+if [ -z "$PREVIOUS_VERSION" ]; then fix_ntp; fi
 
 cat > "$CONF" <<EOF_CONF
 INSTALLED_VERSION='$SCRIPT_VERSION'
@@ -898,16 +899,19 @@ sh -n /usr/bin/podkop-late-start || die "late-start syntax check failed"
 sh -n /usr/bin/podkop-health || die "health watchdog syntax check failed"
 sh -n /usr/bin/podkop-awg-update || die "update checker syntax check failed"
 
-# Persist only the normal/default state. Runtime failover/hold changes are not committed.
-uci set "podkop.$PODKOP_SECTION.connection_type=vpn"
-uci set "podkop.$PODKOP_SECTION.interface=$MAIN_AWG"
-uci_set_if_empty podkop.settings.dns_type udp
-uci_set_if_empty podkop.settings.dns_server 8.8.8.8
-uci_set_if_empty podkop.settings.bootstrap_dns_server 1.1.1.1
-uci set "podkop.$PODKOP_SECTION.domain_resolver_enabled=1"
-uci_set_if_empty "podkop.$PODKOP_SECTION.domain_resolver_dns_type" doh
-uci_set_if_empty "podkop.$PODKOP_SECTION.domain_resolver_dns_server" 8.8.8.8
-uci commit podkop
+# Bootstrap Podkop defaults only on a fresh install. An upgrade may be
+# running through the backup slot or have unrelated pending UCI changes.
+if [ -z "$PREVIOUS_VERSION" ]; then
+    uci set "podkop.$PODKOP_SECTION.connection_type=vpn"
+    uci set "podkop.$PODKOP_SECTION.interface=$MAIN_AWG"
+    uci_set_if_empty podkop.settings.dns_type udp
+    uci_set_if_empty podkop.settings.dns_server 8.8.8.8
+    uci_set_if_empty podkop.settings.bootstrap_dns_server 1.1.1.1
+    uci set "podkop.$PODKOP_SECTION.domain_resolver_enabled=1"
+    uci_set_if_empty "podkop.$PODKOP_SECTION.domain_resolver_dns_type" doh
+    uci_set_if_empty "podkop.$PODKOP_SECTION.domain_resolver_dns_server" 8.8.8.8
+    uci commit podkop
+fi
 
 /etc/init.d/podkop-awg-failover disable >/dev/null 2>&1 || true
 /etc/init.d/podkop-awg-failover stop >/dev/null 2>&1 || true
@@ -937,7 +941,7 @@ done
 if [ "$APPLY_NOW" = "1" ]; then
     # Services were stopped above. Starting avoids redundant procd delete calls,
     # which print the harmless but confusing "Command failed: Not found".
-    /etc/init.d/podkop-late-start start
+    if [ -z "$PREVIOUS_VERSION" ]; then /etc/init.d/podkop-late-start start; fi
     /etc/init.d/podkop-awg-failover start
     /etc/init.d/podkop-health start
     /etc/init.d/podkop-awg-update start
