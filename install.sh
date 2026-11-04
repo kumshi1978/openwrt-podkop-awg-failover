@@ -913,41 +913,56 @@ if [ -z "$PREVIOUS_VERSION" ]; then
     uci commit podkop
 fi
 
-/etc/init.d/podkop-awg-failover disable >/dev/null 2>&1 || true
-/etc/init.d/podkop-awg-failover stop >/dev/null 2>&1 || true
-/etc/init.d/podkop-health disable >/dev/null 2>&1 || true
-/etc/init.d/podkop-health stop >/dev/null 2>&1 || true
-/etc/init.d/podkop-late-start stop >/dev/null 2>&1 || true
-/etc/init.d/podkop-awg-update disable >/dev/null 2>&1 || true
-/etc/init.d/podkop-awg-update stop >/dev/null 2>&1 || true
-
-# rc.common disable only knows the current START/STOP values. Remove stale links
-# left by older releases (for example S98 after late-start moved to START=100).
-for rc_link in \
-    /etc/rc.d/S[0-9][0-9]podkop-late-start \
-    /etc/rc.d/S[0-9][0-9][0-9]podkop-late-start \
-    /etc/rc.d/K[0-9][0-9]podkop-late-start \
-    /etc/rc.d/K[0-9][0-9][0-9]podkop-late-start
-do
-    [ -e "$rc_link" ] || [ -L "$rc_link" ] || continue
-    rm -f "$rc_link"
-done
-
-/etc/init.d/podkop-awg-failover enable
-/etc/init.d/podkop-health enable
-/etc/init.d/podkop-late-start enable
-/etc/init.d/podkop-awg-update enable
-
-if [ "$APPLY_NOW" = "1" ]; then
-    # Services were stopped above. Starting avoids redundant procd delete calls,
-    # which print the harmless but confusing "Command failed: Not found".
-    if [ -z "$PREVIOUS_VERSION" ]; then /etc/init.d/podkop-late-start start; fi
-    /etc/init.d/podkop-awg-failover start
-    /etc/init.d/podkop-health start
-    /etc/init.d/podkop-awg-update start
-    say "Installed/updated and applied now."
+if [ -n "$PREVIOUS_VERSION" ]; then
+    # Keep the existing rc.d links and apply only to running, long-lived services.
+    if [ "$APPLY_NOW" = "1" ]; then
+        for service in podkop-awg-failover podkop-health podkop-awg-update; do
+            init="/etc/init.d/$service"
+            if "$init" running >/dev/null 2>&1; then
+                "$init" restart || die "could not restart $service"
+            fi
+        done
+        say "Updated existing failover services; boot policy preserved."
+    else
+        say "Updated failover files; APPLY_NOW=0."
+    fi
 else
-    say "Installed/updated. APPLY_NOW=0, so changes will activate on next boot."
+    /etc/init.d/podkop-awg-failover disable >/dev/null 2>&1 || true
+    /etc/init.d/podkop-awg-failover stop >/dev/null 2>&1 || true
+    /etc/init.d/podkop-health disable >/dev/null 2>&1 || true
+    /etc/init.d/podkop-health stop >/dev/null 2>&1 || true
+    /etc/init.d/podkop-late-start stop >/dev/null 2>&1 || true
+    /etc/init.d/podkop-awg-update disable >/dev/null 2>&1 || true
+    /etc/init.d/podkop-awg-update stop >/dev/null 2>&1 || true
+
+    # rc.common disable only knows the current START/STOP values. Remove stale links
+    # left by older releases (for example S98 after late-start moved to START=100).
+    for rc_link in \
+        /etc/rc.d/S[0-9][0-9]podkop-late-start \
+        /etc/rc.d/S[0-9][0-9][0-9]podkop-late-start \
+        /etc/rc.d/K[0-9][0-9]podkop-late-start \
+        /etc/rc.d/K[0-9][0-9][0-9]podkop-late-start
+    do
+        [ -e "$rc_link" ] || [ -L "$rc_link" ] || continue
+        rm -f "$rc_link"
+    done
+
+    /etc/init.d/podkop-awg-failover enable
+    /etc/init.d/podkop-health enable
+    /etc/init.d/podkop-late-start enable
+    /etc/init.d/podkop-awg-update enable
+
+    if [ "$APPLY_NOW" = "1" ]; then
+        # Services were stopped above. Starting avoids redundant procd delete calls,
+        # which print the harmless but confusing "Command failed: Not found".
+        /etc/init.d/podkop-late-start start
+        /etc/init.d/podkop-awg-failover start
+        /etc/init.d/podkop-health start
+        /etc/init.d/podkop-awg-update start
+        say "Installed/updated and applied now."
+    else
+        say "Installed/updated. APPLY_NOW=0, so changes will activate on next boot."
+    fi
 fi
 
 say "Version:       $SCRIPT_VERSION"
