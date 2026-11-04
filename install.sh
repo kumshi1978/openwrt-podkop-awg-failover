@@ -108,7 +108,7 @@ case "$APPLY_NOW" in 0|1) ;; *) die "APPLY_NOW must be 0 or 1" ;; esac
 
 # Fetch every updater component before changing the live installation. Stable
 # release updates set UPDATE_SOURCE_REF to the exact release tag.
-mkdir -p "$UPDATE_TMP"
+UPDATE_TMP="$(mktemp -d /tmp/podkop-awg-update-install.XXXXXX)" || die "cannot create private updater temp directory"
 trap 'rm -rf "$UPDATE_TMP"' EXIT INT TERM
 for update_file in podkop-awg-update podkop-awg-update.init podkop-awg-update.conf; do
     curl -4 -fsSL --connect-timeout 10 --max-time "$COMMAND_TIMEOUT" \
