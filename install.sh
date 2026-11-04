@@ -268,6 +268,10 @@ restart_podkop() {
 maintenance_lock() {
     # A kernel lock is released on exit, crash or reboot. Keep its inode stable.
     if command -v flock >/dev/null 2>&1; then
+        [ ! -L /var/run/home-net-vpn-maintenance.lock ] || return 1
+        if [ -e /var/run/home-net-vpn-maintenance.lock ]; then
+            [ -f /var/run/home-net-vpn-maintenance.lock ] || return 1
+        fi
         (umask 077; : >>/var/run/home-net-vpn-maintenance.lock) || return 1
         exec 9>>/var/run/home-net-vpn-maintenance.lock || return 1
         flock -n 9 || return 1
@@ -585,6 +589,10 @@ log "default route is ready; waiting up to ${BOOT_READY_WAIT}s for stock Podkop 
 maintenance_lock() {
     # A kernel lock is released on exit, crash or reboot. Keep its inode stable.
     if command -v flock >/dev/null 2>&1; then
+        [ ! -L /var/run/home-net-vpn-maintenance.lock ] || return 1
+        if [ -e /var/run/home-net-vpn-maintenance.lock ]; then
+            [ -f /var/run/home-net-vpn-maintenance.lock ] || return 1
+        fi
         (umask 077; : >>/var/run/home-net-vpn-maintenance.lock) || return 1
         exec 9>>/var/run/home-net-vpn-maintenance.lock || return 1
         flock -n 9 || return 1
@@ -774,6 +782,10 @@ diagnose_network() {
 maintenance_lock() {
     # A kernel lock is released on exit, crash or reboot. Keep its inode stable.
     if command -v flock >/dev/null 2>&1; then
+        [ ! -L /var/run/home-net-vpn-maintenance.lock ] || return 1
+        if [ -e /var/run/home-net-vpn-maintenance.lock ]; then
+            [ -f /var/run/home-net-vpn-maintenance.lock ] || return 1
+        fi
         (umask 077; : >>/var/run/home-net-vpn-maintenance.lock) || return 1
         exec 9>>/var/run/home-net-vpn-maintenance.lock || return 1
         flock -n 9 || return 1
@@ -820,7 +832,7 @@ recover_podkop() {
         waited=0
         while [ "$waited" -lt 30 ]; do
             if podkop_ready; then
-                /etc/init.d/podkop-awg-failover start >/dev/null 2>&1 || true
+                /etc/init.d/podkop-awg-failover start 9>&- >/dev/null 2>&1 || true
                 log "recovery completed; failover watchdog restarted"
                 diagnose_network
                 rm -f "$RECOVERY_LOCK/pid"
@@ -833,7 +845,7 @@ recover_podkop() {
         done
         attempt=$((attempt + 1))
     done
-    /etc/init.d/podkop-awg-failover start >/dev/null 2>&1 || true
+    /etc/init.d/podkop-awg-failover start 9>&- >/dev/null 2>&1 || true
     log "recovery failed after $PODKOP_RETRIES attempts; will retry after further health checks"
     rm -f "$RECOVERY_LOCK/pid"
     rmdir "$RECOVERY_LOCK" 2>/dev/null || true
