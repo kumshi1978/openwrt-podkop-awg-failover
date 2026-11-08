@@ -198,6 +198,10 @@ EOF_CONF
 
 cat > /usr/bin/podkop-awg-failover <<'EOF_WATCH'
 #!/bin/sh
+if [ "${1:-}" = --capabilities ]; then
+    printf '%s\n' 'awg_main awg_backup awg_backup2'
+    exit 0
+fi
 
 CONF=/etc/podkop-awg-failover.conf
 [ -r "$CONF" ] && . "$CONF"
