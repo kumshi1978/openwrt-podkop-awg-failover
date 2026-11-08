@@ -179,6 +179,7 @@ cat > "$CONF" <<EOF_CONF
 INSTALLED_VERSION='$SCRIPT_VERSION'
 MAIN_AWG='$MAIN_AWG'
 BACKUP_AWG='$BACKUP_AWG'
+BACKUP2_AWG='$(oldval BACKUP2_AWG 2>/dev/null || true)'
 PODKOP_SECTION='$PODKOP_SECTION'
 CHECK_HOST='$CHECK_HOST'
 CHECK_INTERVAL='$CHECK_INTERVAL'
@@ -288,10 +289,20 @@ set_vpn() (
     if [ "$current_type" = "vpn" ] && [ "$current_if" = "$target" ]; then
         return 0
     fi
+    if [ -n "${2:-}" ] && [ "$current_if" != "$2" ]; then
+        log "active VPN changed during probes; transition deferred"
+        return 1
+    fi
     log "Podkop state -> vpn via $target"
     uci set "podkop.$SECTION.connection_type=vpn"
     uci set "podkop.$SECTION.interface=$target"
-    restart_podkop
+    if ! restart_podkop; then
+        if [ -n "${2:-}" ]; then
+            uci set "podkop.$SECTION.interface=$current_if"
+            restart_podkop || log "ordered rollback requires recovery"
+        fi
+        return 1
+    fi
 )
 
 enter_hold() {
@@ -318,6 +329,55 @@ log "watchdog started: main=$MAIN backup=$BACKUP active=$active kill_switch=$KIL
 log "startup grace: waiting ${STARTUP_GRACE} seconds"
 sleep "$STARTUP_GRACE"
 log "startup grace finished, monitoring started"
+
+# BEGIN ORDERED THREE SLOT POLICY
+ordered_step() {
+    selected=$(uci -q get "podkop.$SECTION.interface") || return 1
+    [ "$(uci -q get "podkop.$SECTION.connection_type")" = vpn ] || return 1
+    case "$selected" in "$MAIN") rank=0 ;; "$BACKUP") rank=1 ;; "$BACKUP2") rank=2 ;; *) return 1 ;; esac
+    if [ "${ordered_previous:-}" != "$selected" ]; then ordered_failures=0; fi
+    ordered_previous=$selected
+    check_tunnel "$MAIN"; status0=$?
+    check_tunnel "$BACKUP"; status1=$?
+    check_tunnel "$BACKUP2"; status2=$?
+    [ "$status0" != 0 ] || recovered0=$(( ${recovered0:-0} + 1 ))
+    [ "$status1" != 0 ] || recovered1=$(( ${recovered1:-0} + 1 ))
+    [ "$status2" != 0 ] || recovered2=$(( ${recovered2:-0} + 1 ))
+    [ "$status0" != 1 ] || recovered0=0
+    [ "$status1" != 1 ] || recovered1=0
+    [ "$status2" != 1 ] || recovered2=0
+    [ "${recovered0:-0}" -le "$RECOVER_LIMIT" ] || recovered0=$RECOVER_LIMIT
+    [ "${recovered1:-0}" -le "$RECOVER_LIMIT" ] || recovered1=$RECOVER_LIMIT
+    [ "${recovered2:-0}" -le "$RECOVER_LIMIT" ] || recovered2=$RECOVER_LIMIT
+    target=
+    if [ "$rank" -gt 0 ] && [ "$status0" = 0 ] && [ "${recovered0:-0}" -ge "$RECOVER_LIMIT" ]; then target=$MAIN
+    elif [ "$rank" -gt 1 ] && [ "$status1" = 0 ] && [ "${recovered1:-0}" -ge "$RECOVER_LIMIT" ]; then target=$BACKUP; fi
+    case "$rank" in 0) current_status=$status0 ;; 1) current_status=$status1 ;; 2) current_status=$status2 ;; esac
+    case "$current_status" in
+        0) ordered_failures=0 ;;
+        1) ordered_failures=$(( ${ordered_failures:-0} + 1 )) ;;
+        *) log "active check unknown; keeping VPN and failure counter" ;;
+    esac
+    if [ -z "$target" ] && [ "$current_status" = 1 ] && [ "$ordered_failures" -ge "$FAIL_LIMIT" ]; then
+        if [ "$status0" = 0 ]; then target=$MAIN
+        elif [ "$status1" = 0 ]; then target=$BACKUP
+        elif [ "$status2" = 0 ]; then target=$BACKUP2
+        else log "all VPN candidates unavailable or unknown; keeping current route fail-closed"; fi
+    fi
+    [ -n "$target" ] || return 0
+    set_vpn "$target" "$selected" || return 1
+    ordered_failures=0; recovered0=0; recovered1=0; recovered2=0
+}
+# END ORDERED THREE SLOT POLICY
+
+if [ -n "${BACKUP2_AWG:-}" ]; then
+    BACKUP2=$BACKUP2_AWG
+    case "$MAIN:$BACKUP:$BACKUP2" in awg_main:awg_backup:awg_backup2) ;; *) log "unsupported three-slot assignment"; exit 1 ;; esac
+    while true; do
+        ordered_step || log "ordered transition deferred or failed"
+        sleep "$INTERVAL"
+    done
+fi
 
 while true; do
     case "$active" in
