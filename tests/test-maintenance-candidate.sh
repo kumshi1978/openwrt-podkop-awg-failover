@@ -133,8 +133,8 @@ ls -l "$FIXTURE/etc/rc.d" >"$tmp/links-after"
 cmp "$tmp/links-before" "$tmp/links-after"
 cmp "$tmp/expected" "$INSTALL_CALLS"
 cmp "$tmp/update-before" "$FIXTURE/etc/podkop-awg-update.conf"
-for setting in "INSTALLED_VERSION='1.4.2'" "MAIN_AWG='awg_main'" "BACKUP_AWG='awg_backup'" \
+for setting in "INSTALLED_VERSION='1.5.0'" "MAIN_AWG='awg_main'" "BACKUP_AWG='awg_backup'" \
     "CHECK_INTERVAL='23'" "FAIL_LIMIT='7'" "RECOVER_LIMIT='5'"; do
     grep -Fx "$setting" "$FIXTURE/etc/podkop-awg-failover.conf" >/dev/null
 done
-printf '%s\n' 'PASS: relocated failover 1.4.1 to 1.4.2 installer upgrade'
+printf '%s\n' 'PASS: relocated failover 1.4.1 to 1.5.0 installer upgrade'
