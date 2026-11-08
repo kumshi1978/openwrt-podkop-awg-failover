@@ -23,4 +23,14 @@ h0=1; step; step; [ "$selected_test" = "$MAIN" ]
 h1=0 expected_failure=1
 if step; then echo 'switch failure must propagate' >&2; exit 1; fi
 [ "$selected_test" = "$MAIN" ]
+# Priority roles can use different physical names.
+MAIN=awg_backup BACKUP=awg_main BACKUP2=awg_backup2
+selected_test=$MAIN; expected_failure=0; history=
+ordered_previous=; ordered_failures=0; recovered0=0; recovered1=0; recovered2=0
+h0=1 h1=0 h2=0
+step; step; [ "$selected_test" = "$BACKUP" ]
+h1=1; step; step; [ "$selected_test" = "$BACKUP2" ]
+h0=0; step; step; step; [ "$selected_test" = "$MAIN" ]
+[ "$history" = ' awg_main awg_backup2 awg_backup' ]
+
 echo 'PASS ordered failure, stable recovery, unknown, fail-closed and switch rejection'

@@ -402,7 +402,10 @@ ordered_step() {
 if [ -n "${BACKUP2_AWG:-}" ]; then
     BACKUP2=$BACKUP2_AWG
     command -v flock >/dev/null 2>&1 || { log "three-slot failover requires maintenance locking"; exit 1; }
-    case "$MAIN:$BACKUP:$BACKUP2" in awg_main:awg_backup:awg_backup2) ;; *) log "unsupported three-slot assignment"; exit 1 ;; esac
+    for selected_slot in "$MAIN" "$BACKUP" "$BACKUP2"; do
+        case "$selected_slot" in awg_main|awg_backup|awg_backup2) ;; *) log "unsupported three-slot assignment";exit 1;; esac
+    done
+    [ "$MAIN" != "$BACKUP" ] && [ "$MAIN" != "$BACKUP2" ] && [ "$BACKUP" != "$BACKUP2" ] || { log "duplicate three-slot assignment";exit 1; }
     while true; do
         ordered_step || log "ordered transition deferred or failed"
         sleep "$INTERVAL"
@@ -949,7 +952,14 @@ log "boot recovery mode: waiting ${STARTUP_GRACE}s before health enforcement"
 sleep "$STARTUP_GRACE"
 diagnose_network
 
+refresh_primary() {
+    configured=$(sed -n "s/^MAIN_AWG='\([^']*\)'$/\1/p" "$CONF")
+    case "$configured" in ''|*[!A-Za-z0-9_]*) return ;; esac
+    MAIN=$configured
+}
+
 while true; do
+    refresh_primary
     if podkop_ready; then
         [ "$fail_count" -gt 0 ] && log "health check recovered"
         fail_count=0
