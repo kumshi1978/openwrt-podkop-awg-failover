@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-SCRIPT_VERSION="1.4.2"
+SCRIPT_VERSION="1.5.0"
 CONF="/etc/podkop-awg-failover.conf"
 BACKUP_DIR="/root/podkop-awg-backup-$(date +%Y%m%d-%H%M%S)"
 UPDATE_SOURCE_REF="${UPDATE_SOURCE_REF:-main}"
@@ -334,6 +334,31 @@ log "startup grace: waiting ${STARTUP_GRACE} seconds"
 sleep "$STARTUP_GRACE"
 log "startup grace finished, monitoring started"
 
+ordered_probe() {
+    dns_ready || return 2
+    ordered_unknown=0
+    for ordered_url in https://ifconfig.me/ip https://api.ipify.org; do
+        ordered_response=$(curl -q -4 --noproxy '*' --interface "if!$1" --connect-timeout 5 --max-time 10 --max-filesize 128 -fsS -w '\n%{http_code}' "$ordered_url" 2>/dev/null)
+        ordered_rc=$?
+        ordered_http=$(printf '%s\n' "$ordered_response" | tail -n 1)
+        ordered_ip=$(printf '%s\n' "$ordered_response" | sed '$d')
+        if [ "$ordered_rc" = 0 ] && [ "$ordered_http" = 200 ] && printf '%s\n' "$ordered_ip" | awk -F. '
+            NF!=4 {bad=1} {for(i=1;i<=NF;i++) if($i !~ /^[0-9]+$/ || $i>255)bad=1} END{exit(NR!=1 || bad)}'; then
+            ordered_now=$(date +%s)
+            awg show "$1" latest-handshakes 2>/dev/null | awk -v now="$ordered_now" '
+                NF!=2 || $2 !~ /^[0-9]+$/ || $2<=0 || $2>now || now-$2>180 {bad=1} END{exit(NR!=1 || bad)}' || return 1
+            return 0
+        fi
+        case "$ordered_rc:$ordered_http" in
+            6:*) return 2 ;;
+            7:*|28:*|35:*|52:*|56:*) ;; # bounded transport failures
+            *) ordered_unknown=1 ;; # HTTP rate limits/server errors or invalid bodies are not tunnel proof
+        esac
+    done
+    [ "$ordered_unknown" = 0 ] || return 2
+    return 1
+}
+
 # BEGIN ORDERED THREE SLOT POLICY
 ordered_step() {
     selected=$(uci -q get "podkop.$SECTION.interface") || return 1
@@ -341,9 +366,9 @@ ordered_step() {
     case "$selected" in "$MAIN") rank=0 ;; "$BACKUP") rank=1 ;; "$BACKUP2") rank=2 ;; *) return 1 ;; esac
     if [ "${ordered_previous:-}" != "$selected" ]; then ordered_failures=0; fi
     ordered_previous=$selected
-    check_tunnel "$MAIN"; status0=$?
-    check_tunnel "$BACKUP"; status1=$?
-    check_tunnel "$BACKUP2"; status2=$?
+    ordered_probe "$MAIN"; status0=$?
+    ordered_probe "$BACKUP"; status1=$?
+    ordered_probe "$BACKUP2"; status2=$?
     [ "$status0" != 0 ] || recovered0=$(( ${recovered0:-0} + 1 ))
     [ "$status1" != 0 ] || recovered1=$(( ${recovered1:-0} + 1 ))
     [ "$status2" != 0 ] || recovered2=$(( ${recovered2:-0} + 1 ))
@@ -376,6 +401,7 @@ ordered_step() {
 
 if [ -n "${BACKUP2_AWG:-}" ]; then
     BACKUP2=$BACKUP2_AWG
+    command -v flock >/dev/null 2>&1 || { log "three-slot failover requires maintenance locking"; exit 1; }
     case "$MAIN:$BACKUP:$BACKUP2" in awg_main:awg_backup:awg_backup2) ;; *) log "unsupported three-slot assignment"; exit 1 ;; esac
     while true; do
         ordered_step || log "ordered transition deferred or failed"

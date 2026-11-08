@@ -9,7 +9,7 @@ MAIN=awg_main BACKUP=awg_backup BACKUP2=awg_backup2 SECTION=main FAIL_LIMIT=2 RE
 selected_test=$MAIN; history=; expected_failure=0
 uci() { case "$*" in *connection_type) echo vpn ;; *) echo "$selected_test" ;; esac; }
 log() { :; }
-check_tunnel() { case "$1" in "$MAIN") return "$h0" ;; "$BACKUP") return "$h1" ;; "$BACKUP2") return "$h2" ;; esac; }
+ordered_probe() { case "$1" in "$MAIN") return "$h0" ;; "$BACKUP") return "$h1" ;; "$BACKUP2") return "$h2" ;; esac; }
 set_vpn() { [ "$2" = "$selected_test" ]; [ "$expected_failure" = 0 ] || return 1; selected_test=$1; history="$history $1"; }
 # Calls deliberately do not use errexit: status 1/2 are probe results.
 step() { set +e; ordered_step; result=$?; set -e; return "$result"; }
